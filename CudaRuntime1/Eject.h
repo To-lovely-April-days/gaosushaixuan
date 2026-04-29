@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 extern char firstByte;
 void ControlValvesWithRows(char* tags, int img_width);

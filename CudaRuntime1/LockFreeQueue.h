@@ -1,4 +1,4 @@
-#ifndef LOCK_FREE_QUEUE_H
+ï»¿#ifndef LOCK_FREE_QUEUE_H
 #define LOCK_FREE_QUEUE_H
 
 #include <atomic>
@@ -29,7 +29,7 @@ private:
 
 template<typename T>
 LockFreeQueue<T>::LockFreeQueue() : queueSize(0) {
-    Node* dummy = new Node(T());  // ÑÆ½Úµã
+    Node* dummy = new Node(T());  // å“‘èŠ‚ç‚¹
     head.store(dummy);
     tail.store(dummy);
 }
@@ -47,11 +47,11 @@ void LockFreeQueue<T>::enqueue(T value) {
     Node* newNode = new Node(value);
     Node* oldTail = tail.load();
     while (!tail.compare_exchange_weak(oldTail, newNode)) {
-        // ±£Ö¤Î²Ö¸ÕëµÄ¸üĞÂÊÇÏß³Ì°²È«µÄ
+        // ä¿è¯å°¾æŒ‡é’ˆçš„æ›´æ–°æ˜¯çº¿ç¨‹å®‰å…¨çš„
     }
     oldTail->next.store(newNode);
 
-    queueSize.fetch_add(1, std::memory_order_relaxed);  // Èë¶ÓÊ±£¬Ôö¼Ó¶ÓÁĞ´óĞ¡
+    queueSize.fetch_add(1, std::memory_order_relaxed);  // å…¥é˜Ÿæ—¶ï¼Œå¢åŠ é˜Ÿåˆ—å¤§å°
 }
 
 template<typename T>
@@ -59,12 +59,12 @@ bool LockFreeQueue<T>::dequeue(T& result) {
     Node* oldHead = head.load();
     Node* newHead = oldHead->next.load();
     if (newHead == nullptr) {
-        return false;  // ¶ÓÁĞÎª¿Õ
+        return false;  // é˜Ÿåˆ—ä¸ºç©º
     }
     result = newHead->data;
-    head.store(newHead);  // ¸üĞÂÍ·Ö¸Õë
+    head.store(newHead);  // æ›´æ–°å¤´æŒ‡é’ˆ
 
-    queueSize.fetch_sub(1, std::memory_order_relaxed);  // ³ö¶ÓÊ±£¬¼õÉÙ¶ÓÁĞ´óĞ¡
+    queueSize.fetch_sub(1, std::memory_order_relaxed);  // å‡ºé˜Ÿæ—¶ï¼Œå‡å°‘é˜Ÿåˆ—å¤§å°
 
     delete oldHead;
     return true;
@@ -72,7 +72,7 @@ bool LockFreeQueue<T>::dequeue(T& result) {
 
 template<typename T>
 int LockFreeQueue<T>::size() const {
-    return queueSize.load(std::memory_order_relaxed);  // ·µ»Ø¶ÓÁĞ´óĞ¡
+    return queueSize.load(std::memory_order_relaxed);  // è¿”å›é˜Ÿåˆ—å¤§å°
 }
 
 #endif // LOCK_FREE_QUEUE_H
