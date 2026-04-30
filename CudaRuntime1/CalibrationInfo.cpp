@@ -1,1 +1,6 @@
-﻿#include "CalibrationInfo.h"
+﻿// ============================================================================
+// 文件名：CalibrationInfo.cpp
+// 作用  ：CalibrationInfo 类的实现文件
+// 说明  ：所有方法都在 CalibrationInfo.h 中以 inline 形式定义，本文件仅做编译入口
+// ============================================================================
+#include "CalibrationInfo.h"
