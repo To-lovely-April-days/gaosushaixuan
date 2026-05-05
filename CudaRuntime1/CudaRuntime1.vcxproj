@@ -72,7 +72,7 @@
       <Include>
       </Include>
       <GenerateRelocatableDeviceCode>false</GenerateRelocatableDeviceCode>
-      <CodeGeneration>compute_80,sm_80</CodeGeneration>
+      <CodeGeneration>compute_75,sm_75;compute_86,sm_86;compute_89,sm_89;compute_120,sm_120</CodeGeneration>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -102,17 +102,21 @@
   <ItemGroup>
     <ClInclude Include="CalibrationInfo.h" />
     <ClInclude Include="Eject.h" />
+    <ClInclude Include="EventLog.h" />
     <ClInclude Include="kernel.h" />
     <ClInclude Include="LockFreeQueue.h" />
     <ClInclude Include="AIModel.h" />
     <ClInclude Include="PlsAI.h" />
+
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="CalibrationInfo.cpp" />
+    <ClCompile Include="EventLog.cpp" />
     <ClCompile Include="LockFreeQueue.cpp" />
     <ClCompile Include="AIModel.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="PlsAI.cpp" />
+
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />

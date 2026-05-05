@@ -1,34 +1,18 @@
 ﻿// ============================================================================
 // 文件名：Eject.cpp
-// 作用  ：阀控通信模块的实现（串口版本）
+// 作用  ：阀控通信模块的实现（串口 + 按帧动态延迟补偿）
 //
-// 通信流程：
-//   1) 程序启动：调 Start_send() 打开 COM 口
-//   2) 每批数据：调 ControlValvesWithRows()
-//        a) 根据 sel_type[] 过滤要剔除的种类
-//        b) 5x5 区域和过滤（积分图加速）
-//        c) 十字膨胀（可选）
-//        d) 50 帧取并集 → 192 阀触发状态
-//        e) 合并连续阀号 → 每段一条 7 字节命令
-//        f) 串口发送
-//   3) 程序退出：调 Stop_send() 关闭串口
-//
-// 7 字节协议详解：
-//   字节 0: 0xFF                    （帧头）
-//   字节 1: start_idx (1 字节)      （起始阀号，1~192）
-//   字节 2: end_idx   (1 字节)      （结束阀号，1~192）
-//   字节 3: delay_h   (1 字节)      （延时高字节）
-//   字节 4: delay_l   (1 字节)      （延时低字节）
-//   字节 5: duration_h(1 字节)      （吹气时长高字节）
-//   字节 6: duration_l(1 字节)      （吹气时长低字节）
+// v2 重大改动（相对旧版）：
+//   1. 启动时一次性生成阀号映射表 g_valveMap[192]（含倒序映射）
+//   2. 处理粒度：批 → 帧（ProcessOneFrame 处理 1 帧的 640 像素）
+//   3. 新增 g_valveThreshold 参数（阀触发阈值）
+//   4. 删除：5x5 过滤、阀位膨胀（EnhanceTags）、ControlValvesWithRows、批中点延迟
+//   5. 优化：每帧的多条命令打包成一次 WriteFile（减少串口调用开销）
+//   6. 删除 g_useDelayCompensation 开关、OpenAir 旧路径
 // ============================================================================
 #include "Eject.h"
-// ============================================================================
-// 关键：必须先 include WinSock2.h 再 include windows.h
-// 否则 windows.h 会先拉入旧的 winsock.h，与 WinSock2.h 冲突，
-// 报 "WSADATA / SOCKET / hostent 已定义" 等大量错误
-// 也可以用 #define WIN32_LEAN_AND_MEAN 让 windows.h 不拉入 winsock.h
-// ============================================================================
+#include "EventLog.h"
+
 #define WIN32_LEAN_AND_MEAN
 #include <WinSock2.h>
 #include <ws2tcpip.h>
@@ -43,50 +27,94 @@
 #pragma comment(lib, "ws2_32.lib")
 
 // ============================================================================
-// 外部全局变量（在 main.cpp 中定义）
+// 外部全局变量
 // ============================================================================
-extern int dealCount;   // 一批处理的帧数（默认 50）
-extern int g_Samples;   // 每帧像素数（默认 640）
-extern int frameq;      // 帧率
+extern int dealCount;
+extern int g_Samples;
+extern int frameq;
 
 // ============================================================================
-// 心跳字节
+// 模块全局变量
 // ============================================================================
 char firstByte = 0;
 
-// ============================================================================
-// 操作屏参数（由 UDP_receive_thread 更新；也有合理默认值）
-// ============================================================================
 int sendok = 0;
-int start_line = 15;       // 兼容字段（已被 SetPixelOffset 取代）
-int end_line = 593;       // 兼容字段
-int sel_type[12] = { 0 };  // 12 类是否需要剔除（1=剔除）
-int percent[12] = { 0 };  // 12 类的 5x5 区域阈值
-int fa_ctl = 0;             // 增强（膨胀）像素数
+int sel_type[12] = { 0 };
+int percent[12] = { 0 };   // v2 已不用，但 UDP 接收逻辑保留兼容
+int fa_ctl = 0;            // v2 已不用，但 UDP 接收逻辑保留兼容
 
 std::atomic<bool> running{ true };
 
-// ============================================================================
-// 阀总数 = 192（与 FPGA 板硬件配置一致）
-// ============================================================================
 const int VALVE_COUNT = 192;
 
-// ============================================================================
-// ===== 用户可配置参数（手改这一段的初值）=====
-// ============================================================================
-static std::string  g_comPort = "COM8";    // 串口号
-static int          g_baudRate = 115200;    // 波特率
-static unsigned short g_duration = 30;        // 吹气时长（毫秒）
-static unsigned short g_delay = 1;         // 延时（毫秒）
-static int          g_frontOffset = 2;         // 前偏移（左侧裁剪像素数）
-static int          g_backOffset = 0;         // 后偏移（右侧裁剪像素数）
-// ============================================================================
+// ===== 阀号映射表（启动时一次性生成，含倒序映射）=====
+ValveRange g_valveMap[VALVE_COUNT];
+bool       g_valveMapReady = false;
 
-// 串口句柄
+// ===== 串口配置参数 =====
+static std::string  g_comPort = "COM8";
+static int          g_baudRate = 961200;
+static unsigned short g_duration = 30;       // 吹气时长（ms）
+static unsigned short g_delay = 1;        // 兼容字段（v2 不再使用）
+static int          g_frontOffset = 0;
+static int          g_backOffset = 0;
+
+// ===== 按帧延迟补偿相关 =====
+unsigned short g_totalDelay = 45;             // 默认 45ms（按帧模式建议值）
+int            g_valveThreshold = 1;          // 默认 1（等同旧逻辑）
+std::atomic<unsigned long long> g_currentFrameTick{ 0 };
+// 中间 4 像素阀（阀 65~128）触发时的横向膨胀范围（阀数）
+//   0 = 不膨胀
+//   1 = ±1 阀（吹 3 个：左 1 + 自己 + 右 1）
+//   2 = ±2 阀（吹 5 个：左 2 + 自己 + 右 2，默认）
+//   3 = ±3 阀（吹 7 个）
+// 注意：膨胀允许跨界（阀 65 可以扩到阀 64 即 3 像素区，反之亦然）
+int g_centerValveInflate = 2;
+
+// ===== 阀冷却机制（v2.1 新增）=====
+// 解决问题：一颗石头横跨多帧时，每帧都发命令导致 FPGA 接收 buffer 堆积，
+//          最终吹气时机错乱漏吹。
+//
+// 工作原理：
+//   - 记录每个阀"上次发命令的时刻"
+//   - 记录每个阀"上一帧的触发状态"
+//   - 本帧某阀想吹时：
+//       a) 如果上一帧也吹了（持续触发）→ 跳过，不重复发
+//       b) 如果上次发命令距今 < 冷却期 → 跳过，不重复发
+//       c) 否则（新触发 + 不在冷却期）→ 允许发命令，记录时间
+//
+// 推荐 g_valveCooldownMs = g_duration（吹气时长），即"上次吹气结束就允许下次"
+static unsigned long long g_lastFireTimeMs[VALVE_COUNT] = { 0 };
+static bool               g_lastValveTrigger[VALVE_COUNT] = { false };
+int g_valveCooldownMs = 30;   // 阀冷却期（ms），默认等于 g_duration
+
+// 统计字段（仅用于运行时观察，不影响功能）
+static std::atomic<unsigned long long> g_totalSuppressedByContinuous{ 0 };  // 因"持续触发"被跳过的次数
+static std::atomic<unsigned long long> g_totalSuppressedByCooldown{ 0 };    // 因"冷却期"被跳过的次数
+static std::atomic<unsigned long long> g_totalFired{ 0 };                    // 实际发出的命令数
+// ===== QPC 时间戳工具 =====
+static LARGE_INTEGER g_qpcFreq;
+static bool g_qpcInited = false;
+
+// ===== 串口句柄 =====
 static HANDLE g_hSerial = INVALID_HANDLE_VALUE;
 
 // ============================================================================
-// 配置函数（可在 Start_send 之前调用，覆盖默认值）
+// QPC 工具：获取毫秒精度时间戳
+// ============================================================================
+unsigned long long NowMs()
+{
+    if (!g_qpcInited) {
+        QueryPerformanceFrequency(&g_qpcFreq);
+        g_qpcInited = true;
+    }
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (unsigned long long)((t.QuadPart * 1000ULL) / g_qpcFreq.QuadPart);
+}
+
+// ============================================================================
+// 配置函数（运行时可调）
 // ============================================================================
 void SetSerialPort(const std::string& comPort, int baudRate) {
     g_comPort = comPort;
@@ -104,20 +132,124 @@ void SetPixelOffset(int frontOffset, int backOffset) {
 }
 
 // ============================================================================
-// Start_send: 打开串口（替换原 UDP 初始化）
+// BuildValveMap: 启动时一次性生成阀号映射表（含倒序映射）
+//
+// v2.3：3/4/3 分布 + 中间阀膨胀（搭配 g_centerValveInflate 使用）
+//   阀 1~64    : 每阀 3 像素（共 192 像素）— 图像右侧
+//   阀 65~128  : 每阀 4 像素（共 256 像素）— 图像中间（膨胀目标区）
+//   阀 129~192 : 每阀 3 像素（共 192 像素）— 图像左侧
+//   合计 640 像素，无重叠无遗漏
+//
+// 倒序映射：物理阀号 fa（0~191）对应图像中第 (191-fa) 段像素区间
+//   阀 1（fa=0）   → 图像最右侧
+//   阀 192（fa=191）→ 图像最左侧
+//
+// 物理图像（像素 0 在左 / 639 在右）从左到右依次是：
+//   阀 192~129（左侧 64 阀，每阀 3 像素）
+//   阀 128~65  （中间 64 阀，每阀 4 像素）← 这部分膨胀
+//   阀 64~1    （右侧 64 阀，每阀 3 像素）
 // ============================================================================
-bool Start_send() {
-    // COM10 以上需要用 "\\\\.\\COM10" 形式
-    std::string fullPort = "\\\\.\\" + g_comPort;
+void BuildValveMap()
+{
+    int x_start = g_frontOffset;
+    int x_end = g_Samples - g_backOffset;
+    int x_range = x_end - x_start;
 
+    if (x_start < 0) x_start = 0;
+    if (x_end > g_Samples) x_end = g_Samples;
+    if (x_range != 640) {
+        std::cerr << "[Eject] BuildValveMap 警告：当前 3/4/3 布局假设 x_range=640，"
+            << "实际 x_range=" << x_range << "（g_Samples=" << g_Samples
+            << " - g_frontOffset=" << g_frontOffset
+            << " - g_backOffset=" << g_backOffset << "）" << std::endl;
+        // 不致命，继续构建
+    }
+    if (x_range <= 0) {
+        std::cerr << "[Eject] BuildValveMap 失败：像素范围无效" << std::endl;
+        g_valveMapReady = false;
+        return;
+    }
+
+    // ===== 构建图像从左到右的"段"列表 =====
+    // 共 192 段，从像素 x_start 开始往右排
+    // 段 0~63   : 每段 3 像素（图像左侧）→ 对应物理阀 192~129
+    // 段 64~127 : 每段 4 像素（图像中间）→ 对应物理阀 128~65
+    // 段 128~191: 每段 3 像素（图像右侧）→ 对应物理阀 64~1
+    int seg_x1[VALVE_COUNT];
+    int seg_x2[VALVE_COUNT];
+    int cur = x_start;
+    for (int seg = 0; seg < VALVE_COUNT; seg++) {
+        int width;
+        if (seg < 64)              width = 3;
+        else if (seg < 128)        width = 4;
+        else                       width = 3;
+
+        seg_x1[seg] = cur;
+        seg_x2[seg] = cur + width - 1;
+        if (seg_x2[seg] >= g_Samples) seg_x2[seg] = g_Samples - 1;
+        cur += width;
+    }
+
+    // ===== 倒序映射：物理阀 fa 对应图像段 (191 - fa) =====
+    for (int fa = 0; fa < VALVE_COUNT; fa++) {
+        int seg = VALVE_COUNT - 1 - fa;
+        g_valveMap[fa].x1 = seg_x1[seg];
+        g_valveMap[fa].x2 = seg_x2[seg];
+    }
+    g_valveMapReady = true;
+
+    // ===== 打印映射表（验证用）=====
+    std::cout << "[Eject] 阀号映射表已生成（v2.3 3/4/3 整数分布，"
+        << "VALVE_COUNT=" << VALVE_COUNT
+        << "，像素范围 [" << x_start << "~" << x_end << "]）：" << std::endl;
+    std::cout << "  分布: 阀1~64=3px / 阀65~128=4px(中间，膨胀目标) / 阀129~192=3px"
+        << std::endl;
+    std::cout << "  中间膨胀: g_centerValveInflate=" << g_centerValveInflate
+        << " (即阀 65~128 触发时向两侧各扩 " << g_centerValveInflate << " 个阀)"
+        << std::endl;
+
+    // 打印前 5 个阀
+    for (int i = 0; i < 5 && i < VALVE_COUNT; i++) {
+        int width = g_valveMap[i].x2 - g_valveMap[i].x1 + 1;
+        std::cout << "  阀 " << (i + 1) << ": 像素 ["
+            << g_valveMap[i].x1 << " ~ " << g_valveMap[i].x2
+            << "] (" << width << "像素)" << std::endl;
+    }
+    std::cout << "  ..." << std::endl;
+    // 打印阀 64~66（边界处，看 3→4 切换）
+    for (int i = 63; i <= 65 && i < VALVE_COUNT; i++) {
+        int width = g_valveMap[i].x2 - g_valveMap[i].x1 + 1;
+        std::cout << "  阀 " << (i + 1) << ": 像素 ["
+            << g_valveMap[i].x1 << " ~ " << g_valveMap[i].x2
+            << "] (" << width << "像素)" << std::endl;
+    }
+    std::cout << "  ..." << std::endl;
+    // 打印阀 128~130（边界处，看 4→3 切换）
+    for (int i = 127; i <= 129 && i < VALVE_COUNT; i++) {
+        int width = g_valveMap[i].x2 - g_valveMap[i].x1 + 1;
+        std::cout << "  阀 " << (i + 1) << ": 像素 ["
+            << g_valveMap[i].x1 << " ~ " << g_valveMap[i].x2
+            << "] (" << width << "像素)" << std::endl;
+    }
+    std::cout << "  ..." << std::endl;
+    // 打印最后 5 个阀
+    for (int i = VALVE_COUNT - 5; i < VALVE_COUNT; i++) {
+        int width = g_valveMap[i].x2 - g_valveMap[i].x1 + 1;
+        std::cout << "  阀 " << (i + 1) << ": 像素 ["
+            << g_valveMap[i].x1 << " ~ " << g_valveMap[i].x2
+            << "] (" << width << "像素)" << std::endl;
+    }
+}
+
+// ============================================================================
+// Start_send: 打开串口
+// ============================================================================
+bool Start_send()
+{
     g_hSerial = CreateFileA(
-        fullPort.c_str(),
+        g_comPort.c_str(),
         GENERIC_READ | GENERIC_WRITE,
-        0,                  // 独占
-        NULL,
-        OPEN_EXISTING,
-        0,                  // 同步 IO
-        NULL);
+        0, NULL, OPEN_EXISTING, 0, NULL);
 
     if (g_hSerial == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
@@ -126,7 +258,6 @@ bool Start_send() {
         return false;
     }
 
-    // 配置串口参数
     DCB dcb = { 0 };
     dcb.DCBlength = sizeof(DCB);
     if (!GetCommState(g_hSerial, &dcb)) {
@@ -153,13 +284,11 @@ bool Start_send() {
         return false;
     }
 
-    // 写超时设置
     COMMTIMEOUTS timeouts = { 0 };
     timeouts.WriteTotalTimeoutConstant = 50;
     timeouts.WriteTotalTimeoutMultiplier = 10;
     SetCommTimeouts(g_hSerial, &timeouts);
 
-    // 清空缓冲
     PurgeComm(g_hSerial, PURGE_RXCLEAR | PURGE_TXCLEAR);
 
     std::cout << "[Eject] 串口打开成功: " << g_comPort
@@ -169,14 +298,22 @@ bool Start_send() {
         << " 有效范围=[" << g_frontOffset << "," << (g_Samples - g_backOffset) << "]"
         << std::endl;
     std::cout << "[Eject] 阀总数=" << VALVE_COUNT
-        << " 吹气=" << g_duration << "ms 延时=" << g_delay << "ms" << std::endl;
+        << " 吹气=" << g_duration << "ms" << std::endl;
+    std::cout << "[Eject] 模式: 按帧动态补偿  g_totalDelay=" << g_totalDelay
+        << "ms  g_valveThreshold=" << g_valveThreshold << std::endl;
+
+    //★ 启动时一次性生成阀号映射表（含倒序映射）★
+      BuildValveMap();
+
+     std::cout << "[Eject] 阀冷却机制: g_valveCooldownMs=" << g_valveCooldownMs
+         << "ms (= g_duration=" << g_duration << "ms 时即吹气一结束就允许下次)"
+        << std::endl;
+
     return true;
 }
 
-// ============================================================================
-// Stop_send: 关闭串口
-// ============================================================================
-void Stop_send() {
+void Stop_send()
+{
     if (g_hSerial != INVALID_HANDLE_VALUE) {
         CloseHandle(g_hSerial);
         g_hSerial = INVALID_HANDLE_VALUE;
@@ -185,216 +322,246 @@ void Stop_send() {
 }
 
 // ============================================================================
-// OpenAir: 发送一条 7 字节阀控命令（私有）
-//   startIndex / endIndex: 阀号（1~192）
-//   duration            : 吹气时长 ms
-//   delay               : 延时 ms
+// ProcessOneFrame: 处理一帧的 640 像素分类结果（v2.4 膨胀+冷却合并版）
+//
+// 流程：
+//   Step 1: 算 192 阀状态
+//   Step 2: ★ 中间 4 像素阀横向膨胀 ★
+//   Step 3: ★ 阀冷却过滤 ★ （新增，关键改动）
+//   Step 4: 合并连续阀号成区间
+//   Step 5: 算 actualDelay
+//   Step 6: 一次 WriteFile 发送
+//   Step 7: 写日志
+//
+// 冷却语义（关键）：
+//   - 对"经过膨胀后"的 valve_trigger 做冷却过滤
+//   - 每个阀如果在 g_valveCooldownMs 内已经发过命令，本帧跳过
+//   - 用 g_lastFireTimeMs[fa] 记录每个阀的最近发命令时刻
+//   - 冷却到期后允许下次发
+//
+// 注意：g_lastValveTrigger 不再用了（旧版的"持续触发"判断），
+//      改用纯时间冷却 —— 更稳定
 // ============================================================================
-static void OpenAir(int startIndex, int endIndex,
-    unsigned short duration, unsigned short delay)
+void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
 {
     if (g_hSerial == INVALID_HANDLE_VALUE) return;
+    if (!g_valveMapReady) return;
 
-    // 范围保护（虽然不会超，但加层保险）
-    if (startIndex < 1)   startIndex = 1;
-    if (endIndex > 255) endIndex = 255;
-    if (startIndex > endIndex) return;
+    g_currentFrameTick.store(frameTickMs);
 
-    unsigned char message[7];
-    message[0] = 0xFF;
-    message[1] = (unsigned char)startIndex;
-    message[2] = (unsigned char)endIndex;
-    message[3] = (unsigned char)(delay >> 8);
-    message[4] = (unsigned char)(delay & 0xFF);
-    message[5] = (unsigned char)(duration >> 8);
-    message[6] = (unsigned char)(duration & 0xFF);
-
-    DWORD bytesWritten = 0;
-    if (!WriteFile(g_hSerial, message, 7, &bytesWritten, NULL)) {
-        std::cerr << "[Eject] 串口写入失败, 错误码: "
-            << GetLastError() << std::endl;
-    }
-}
-
-// ============================================================================
-// send_serial_valve_cmd: 把一批分选结果转换为串口命令
-//
-// 算法：
-//   1) 50 帧取并集 → 得到 192 阀的触发状态
-//      （只要这 50 帧内任何一帧的对应像素被标记，该阀就触发）
-//   2) 把触发的阀号合并成连续区间
-//      例如 [3,4,5,8,9,15] → 区间 (3,5) (8,9) (15,15) 三段
-//   3) 每个区间发一条 7 字节命令
-// ============================================================================
-void send_serial_valve_cmd(char* tags_new)
-{
-    const int ROWS = dealCount;
-    const int COLS = g_Samples;
-
-    // ===== 计算有效像素范围（基于前偏移和后偏移）=====
-    int x_start = g_frontOffset;                // 起始像素（含）
-    int x_end = g_Samples - g_backOffset;     // 结束像素（不含）
-
-    // 范围合法性检查
-    if (x_start < 0)        x_start = 0;
-    if (x_end > g_Samples) x_end = g_Samples;
-    if (x_end <= x_start) {
-        std::cerr << "[Eject] 像素偏移无效, 无法发送命令" << std::endl;
-        return;
-    }
-
-    // 有效像素总宽度
-    int x_range = x_end - x_start;
-
-    // ===== Step 1: 50 帧并集 → 192 阀触发状态 =====
+    // ===== Step 1: 算 192 阀状态 =====
     bool valve_trigger[VALVE_COUNT] = { false };
+    int rawClassified = 0;
 
     for (int fa = 0; fa < VALVE_COUNT; fa++) {
-        // 第 fa 号阀（0-base 内部索引）对应的像素区间
-        // 用整数除法保证不重叠不漏
-        // 例：x_range=638, fa=0 → [2, 5+]   fa=1 → [5, 8+]
-        int fa_x1 = x_range * fa / VALVE_COUNT + x_start;
-        int fa_x2 = x_range * (fa + 1) / VALVE_COUNT + x_start;
-        if (fa_x2 >= COLS) fa_x2 = COLS - 1;
+        int x1 = g_valveMap[fa].x1;
+        int x2 = g_valveMap[fa].x2;
 
-        // 在该像素区间内、所有帧中查找是否有触发
-        bool hit = false;
-        for (int y = 0; y < ROWS && !hit; y++) {
-            const char* row = tags_new + y * COLS;
-            for (int m = fa_x1; m <= fa_x2; m++) {
-                if (row[m] == 1) { hit = true; break; }
+        int hitCount = 0;
+        for (int x = x1; x <= x2; x++) {
+            int cls = (unsigned char)frameTags[x];
+            if (cls > 0 && cls <= 12 && sel_type[cls - 1] == 1) {
+                hitCount++;
             }
         }
-        valve_trigger[fa] = hit;
+
+        rawClassified += hitCount;
+        valve_trigger[fa] = (hitCount >= g_valveThreshold);
     }
 
-    // ===== Step 2: 合并连续阀号成区间 → 发送命令 =====
-    // 注意：阀号外发时从 1 开始（1~192），而内部索引从 0 开始（0~191）
-    // 所以发送时要 +1
-    int i = 0;
+    // ===== Step 2: 中间阀横向膨胀 =====
+    // 中间区域：fa = [64, 127]（即阀号 65~128，4 像素阀）
+    if (g_centerValveInflate > 0) {
+        const int CENTER_VALVE_START = 64;
+        const int CENTER_VALVE_END = 127;
+
+        // 复制原始触发状态（避免膨胀产生的位置又被当作"原始"再扩散）
+        bool original_trigger[VALVE_COUNT];
+        memcpy(original_trigger, valve_trigger, sizeof(valve_trigger));
+
+        for (int fa = CENTER_VALVE_START; fa <= CENTER_VALVE_END; fa++) {
+            if (!original_trigger[fa]) continue;
+
+            // 向左扩展
+            for (int d = 1; d <= g_centerValveInflate; d++) {
+                int left = fa - d;
+                if (left >= 0) valve_trigger[left] = true;
+                else break;
+            }
+            // 向右扩展
+            for (int d = 1; d <= g_centerValveInflate; d++) {
+                int right = fa + d;
+                if (right < VALVE_COUNT) valve_trigger[right] = true;
+                else break;
+            }
+        }
+    }
+
+    // ===== Step 3: 阀冷却过滤（v2.4 新增）=====
+    // 对每个 valve_trigger=true 的阀：
+    //   如果距上次发命令 < g_valveCooldownMs，则跳过（设回 false）
+    //   否则记录"本帧将发命令"，更新 g_lastFireTimeMs
+    //
+    // 注意：g_valveCooldownMs = 0 时跳过冷却（关闭功能）
+    unsigned long long now = NowMs();
+    int suppressedCount = 0;
+
+    if (g_valveCooldownMs > 0) {
+        for (int fa = 0; fa < VALVE_COUNT; fa++) {
+            if (!valve_trigger[fa]) continue;
+
+            unsigned long long lastFire = g_lastFireTimeMs[fa];
+            if (lastFire > 0 && (now - lastFire) < (unsigned long long)g_valveCooldownMs) {
+                // 冷却中 → 跳过这个阀
+                valve_trigger[fa] = false;
+                suppressedCount++;
+            }
+            else {
+                // 允许发命令 → 记录时刻
+                g_lastFireTimeMs[fa] = now;
+            }
+        }
+    }
+
+    // ===== Step 4 + 5 + 6: 合并区间 + 算延迟 + 打包发送 =====
+    unsigned char txBuf[VALVE_COUNT * 7];
+    int txLen = 0;
     int cmdCount = 0;
+
+    long long elapsed = (long long)(now - frameTickMs);
+    long long actualDelay = (long long)g_totalDelay - elapsed;
+    bool wasNegative = false;
+    if (actualDelay < 0) { actualDelay = 0; wasNegative = true; }
+    if (actualDelay > 65535) actualDelay = 65535;
+    unsigned short delay = (unsigned short)actualDelay;
+
+    int currentBatch = g_batchNo.load();
+
+    int i = 0;
     while (i < VALVE_COUNT) {
         if (!valve_trigger[i]) { i++; continue; }
 
         int segStart = i;
         int segEnd = i;
-        // 向右扩展找连续段
         while (segEnd + 1 < VALVE_COUNT && valve_trigger[segEnd + 1]) {
             segEnd++;
         }
 
-        // 发送（内部 0-base → 外部 1-base，所以 +1）
-        OpenAir(segStart + 1, segEnd + 1, g_duration, g_delay);
+        int valveStart = segStart + 1;
+        int valveEnd = segEnd + 1;
+
+        // 算该区间的命中像素数（用于 DETECT 日志）
+        int hitPixels = 0;
+        for (int fa = segStart; fa <= segEnd; fa++) {
+            int x1 = g_valveMap[fa].x1;
+            int x2 = g_valveMap[fa].x2;
+            for (int x = x1; x <= x2; x++) {
+                int cls = (unsigned char)frameTags[x];
+                if (cls > 0 && cls <= 12 && sel_type[cls - 1] == 1) hitPixels++;
+            }
+        }
+        LogValveDetected(currentBatch, valveStart, valveEnd, hitPixels);
+
+        // 把这条命令塞进发送缓冲
+        unsigned char* p = txBuf + txLen;
+        p[0] = 0xFF;
+        p[1] = (unsigned char)valveStart;
+        p[2] = (unsigned char)valveEnd;
+        p[3] = (unsigned char)(delay >> 8);
+        p[4] = (unsigned char)(delay & 0xFF);
+        p[5] = (unsigned char)(g_duration >> 8);
+        p[6] = (unsigned char)(g_duration & 0xFF);
+        txLen += 7;
         cmdCount++;
 
         i = segEnd + 1;
     }
 
-    // 调试输出（生产环境可注释掉）
-    // if (cmdCount > 0) {
-    //     std::cout << "[Eject] 本批发送 " << cmdCount << " 条命令" << std::endl;
-    // }
-}
+    // ===== Step 6: 一次性 WriteFile =====
+    int writeTime = 0;
+    bool writeOk = true;
+    if (txLen > 0) {
+        unsigned long long t_before_write = NowMs();
+        DWORD bytesWritten = 0;
+        BOOL ok = WriteFile(g_hSerial, txBuf, txLen, &bytesWritten, NULL);
+        unsigned long long t_after_write = NowMs();
+        writeTime = (int)(t_after_write - t_before_write);
+        writeOk = (ok && bytesWritten == (DWORD)txLen);
 
-// ============================================================================
-// EnhanceTags: 十字膨胀（保留原算法）
-//   每个 tag==1 的位置，向上下左右各扩展 numAdd 个像素
-// ============================================================================
-void EnhanceTags(char* tags_new, int rows, int cols, int numAdd, char* tags_Enhance)
-{
-    if (numAdd == 0) return;
-    for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < cols; j++) {
-            if (tags_new[i * cols + j] == 1) {
-                int up = (std::max)(i - numAdd, 0);
-                int down = (std::min)(i + numAdd, rows - 1);
-                for (int k = up; k <= down; k++) {
-                    tags_Enhance[k * cols + j] = 1;
-                }
-                int left = (std::max)(j - numAdd, 0);
-                int right = (std::min)(j + numAdd, cols - 1);
-                for (int l = left; l <= right; l++) {
-                    tags_Enhance[i * cols + l] = 1;
-                }
-            }
+        if (!ok) {
+            std::cerr << "[Eject] 串口写入失败, 错误码: " << GetLastError() << std::endl;
+        }
+    }
+
+    // ===== Step 7: 写日志（保持原格式不变）=====
+    {
+        int j = 0;
+        int idx = 0;
+        while (j < VALVE_COUNT && idx < cmdCount) {
+            if (!valve_trigger[j]) { j++; continue; }
+            int segStart = j, segEnd = j;
+            while (segEnd + 1 < VALVE_COUNT && valve_trigger[segEnd + 1]) segEnd++;
+
+            LogValveFiredFrame(segStart + 1, segEnd + 1, g_duration, delay,
+                (int)elapsed, writeTime, wasNegative, writeOk);
+
+            j = segEnd + 1;
+            idx++;
+        }
+    }
+
+    // SUMRY 日志（每帧一条）
+    LogBatchSummary(currentBatch, rawClassified, rawClassified, cmdCount);
+
+    // ===== LATE 累计警告 =====
+    if (wasNegative) {
+        static int g_lateCount = 0;
+        g_lateCount++;
+        if (g_lateCount % 100 == 1) {
+            std::cerr << "[WARN] actualDelay 被截断为 0 已累计 " << g_lateCount
+                << " 次，建议增大 g_totalDelay" << std::endl;
+        }
+    }
+
+    // ===== 串口慢写入告警 =====
+    if (writeTime > 5) {
+        static int g_slowWriteCount = 0;
+        g_slowWriteCount++;
+        if (g_slowWriteCount % 50 == 1) {
+            std::cerr << "[WARN] 串口 WriteFile 耗时 " << writeTime
+                << "ms (累计 " << g_slowWriteCount << " 次>5ms)" << std::endl;
+        }
+    }
+
+    // ===== 冷却统计（每 10 秒一次到控制台，不写日志文件）=====
+    static unsigned long long g_lastStatTick = 0;
+    static unsigned long long g_totalSuppressed = 0;
+    static unsigned long long g_totalFired = 0;
+    g_totalSuppressed += suppressedCount;
+    g_totalFired += cmdCount;
+    if (now - g_lastStatTick >= 10000) {
+        g_lastStatTick = now;
+        unsigned long long total = g_totalSuppressed + g_totalFired;
+        if (total > 0) {
+            std::cout << "[Stats] 10s 内: 实发命令=" << g_totalFired
+                << "  冷却跳过阀次=" << g_totalSuppressed
+                << "  冷却率=" << (g_totalSuppressed * 100 / (g_totalSuppressed + g_totalFired))
+                << "%" << std::endl;
+            g_totalSuppressed = 0;
+            g_totalFired = 0;
         }
     }
 }
-
 // ============================================================================
-// ControlValvesWithRows: 主入口
-//   保持原签名不变，main.cpp 调用方式不改
-// ============================================================================
-void ControlValvesWithRows(char* tags, int img_width)
-{
-    const int ROWS = dealCount;
-    const int COLS = g_Samples;
-    const int total = ROWS * COLS;
-    if (total <= 0) return;
-
-    int numAdd = fa_ctl;
-
-    char* tags_new = new char[total];
-    char* tags_5x5 = new char[total]();
-
-    // ---- Step 1: 根据 sel_type[] 过滤要剔除的种类 ----
-    for (int i = 0; i < total; i++) {
-        int tag_value = (unsigned char)tags[i];
-        // tag_value 是分类 ID（1~12），sel_type[tag_value-1]==1 表示该类要剔除
-        tags_new[i] = (tag_value > 0 && tag_value <= 12 &&
-            sel_type[tag_value - 1] == 1) ? 1 : 0;
-    }
-
-    // ---- Step 2: 5x5 区域和过滤（用积分图加速）----
-    int* integral = new int[(ROWS + 1) * (COLS + 1)]();
-    for (int r = 1; r <= ROWS; r++) {
-        for (int c = 1; c <= COLS; c++) {
-            integral[r * (COLS + 1) + c] =
-                tags_new[(r - 1) * COLS + (c - 1)]
-                + integral[(r - 1) * (COLS + 1) + c]
-                + integral[r * (COLS + 1) + (c - 1)]
-                - integral[(r - 1) * (COLS + 1) + (c - 1)];
-        }
-    }
-    for (int row = 2; row < ROWS - 2; row++) {
-        for (int col = 2; col < COLS - 2; col++) {
-            int idx = row * COLS + col;
-            if (!tags_new[idx]) { tags_5x5[idx] = 0; continue; }
-            int sum = integral[(row + 3) * (COLS + 1) + (col + 3)]
-                - integral[(row - 2) * (COLS + 1) + (col + 3)]
-                - integral[(row + 3) * (COLS + 1) + (col - 2)]
-                + integral[(row - 2) * (COLS + 1) + (col - 2)];
-            tags_5x5[idx] = (sum > percent[0]) ? 1 : 0;
-        }
-    }
-    delete[] integral;
-
-    // ---- Step 3: 阀位增强（可选膨胀）----
-    char* tags_final = tags_5x5;
-    char* tags_Enhance = nullptr;
-    if (numAdd > 0) {
-        tags_Enhance = new char[total]();
-        EnhanceTags(tags_5x5, ROWS, COLS, numAdd, tags_Enhance);
-        tags_final = tags_Enhance;
-    }
-
-    // ---- Step 4: 串口发送阀控命令 ----
-    send_serial_valve_cmd(tags_final);
-
-    // 释放临时缓冲
-    if (tags_Enhance) delete[] tags_Enhance;
-    delete[] tags_new;
-    delete[] tags_5x5;
-}
-
-// ============================================================================
-// UDP_receive_thread: 接收操作屏下发的参数
-//   保留原协议（操作屏仍走 UDP 8080 端口）
-//   接收的字段：sel_type[] / percent[] / fa_ctl
+// UDP 参数接收线程
+//   仍然接收操作屏的数据包（保持兼容），但 v2 中：
+//     - sel_type[] 仍生效
+//     - percent[]、fa_ctl 接收但不使用
 // ============================================================================
 typedef unsigned char byte;
 
-void UDP_receive_thread() {
+void UDP_receive_thread()
+{
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         std::cerr << "[Eject] WSAStartup 失败" << std::endl;
@@ -436,13 +603,11 @@ void UDP_receive_thread() {
             &clientAddrLen);
         if (recvLen > 0 && buf[0] == 2 && buf[1] == 0x2a) {
             sendok = buf[5];
-            // 注意：原 UDP 协议下发的 start_line/end_line 在串口模式下不再使用
-            //      像素偏移由 SetPixelOffset 设置
             for (int i = 0; i < 12; i++) {
                 sel_type[i] = buf[12 + i * 2];
-                percent[i] = buf[13 + i * 2];
+                percent[i] = buf[13 + i * 2];   // v2 不用，保持兼容写入
             }
-            fa_ctl = buf[40];
+            fa_ctl = buf[40];                    // v2 不用，保持兼容写入
         }
     }
 

@@ -310,21 +310,31 @@ __global__ void calcKernel_GPU(char* frameData, float* tempData, float* outputDa
         }
     }
 
-    // ===== Step 2: 扣底（限制反射率范围）=====
+    //// ===== Step 2: 扣底（限制反射率范围）=====
+    //if (otherParams->LimitScopeFlag == 1)
+    //{
+    //    // 注意：这里 LowestValue/HighestValue 被乘以 lengthModel
+    //    // 即把"平均反射率阈值"转换为"累积反射率阈值"
+    //    int lower = otherParams->LowestValue * lengthModel;
+    //    int higher = otherParams->HighestValue * lengthModel;
+
+    //    if (KDsum >= lower && KDsum <= higher)
+    //    {
+    //        tags[idx] = 255;   // 标记为背景，跳过后续计算
+    //        return;
+    //    }
+    //}
+    //扣底（限幅）：反射率累加值落在 [Lowest, Highest] 区间内 → 判定为背景
     if (otherParams->LimitScopeFlag == 1)
     {
-        // 注意：这里 LowestValue/HighestValue 被乘以 lengthModel
-        // 即把"平均反射率阈值"转换为"累积反射率阈值"
-        int lower = otherParams->LowestValue * lengthModel;
-        int higher = otherParams->HighestValue * lengthModel;
-
+        float lower = otherParams->LowestValue * lengthModel;
+        float higher = otherParams->HighestValue * lengthModel;
         if (KDsum >= lower && KDsum <= higher)
         {
-            tags[idx] = 255;   // 标记为背景，跳过后续计算
+            tags[idx] = 255;
             return;
         }
     }
-
     // ===== Step 3: 预处理（按 PreprocessList 顺序执行）=====
     for (int i = 0; i < otherParams->PreprocessCount; i++)
     {
@@ -477,6 +487,7 @@ bool calc_GPU(char* frameData, float* tempData, float* outputData,
     if (cudaStatus != cudaSuccess) {
         return false;
     }
+   
     return true;
 }
 
