@@ -196,3 +196,23 @@ void LogBatchSummary(int batchNo, int rawClassified, int afterFilter, int valveC
         << " cmdSent=" << valveCmdCount
         << "\n";
 }
+
+void LogStats(int frameNo,
+    int pixCls0, int pixCls1, int pixCls2, int pixOther,
+    int valveHit1, int valveHit2, int valveHit3,
+    int threshold)
+{
+    if (!g_logEnabled) return;
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    g_logFile << "[" << getTimestamp() << "] STAT   "
+        << "f=" << frameNo
+        << " px:cls0=" << pixCls0
+        << " cls1=" << pixCls1
+        << " cls2=" << pixCls2;
+    if (pixOther > 0) g_logFile << " other=" << pixOther;
+    g_logFile << "  valves:hit1=" << valveHit1
+        << " hit2=" << valveHit2
+        << " hit3=" << valveHit3
+        << " thr=" << threshold
+        << "\n";
+}

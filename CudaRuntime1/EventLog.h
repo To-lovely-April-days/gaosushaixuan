@@ -53,3 +53,8 @@ void LogBatchSummary(int batchNo, int rawClassified, int afterFilter, int valveC
 
 // 全局批次号
 extern std::atomic<int> g_batchNo;
+
+void LogStats(int frameNo,
+    int pixCls0, int pixCls1, int pixCls2, int pixOther,
+    int valveHit1, int valveHit2, int valveHit3,
+    int threshold);

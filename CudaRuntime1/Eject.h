@@ -44,9 +44,14 @@ extern bool       g_valveMapReady;     // 是否已初始化
 //   3 = 全部 3 个像素都命中才吹（最严格）
 extern int g_valveThreshold;
 
-extern int g_centerValveInflate;
+extern int g_valveThresholdRatio;
 
-extern int g_valveCooldownMs;
+extern int g_centerValveInflate;
+// 帧激活阈值：本帧目标像素总数必须 ≥ 此值，本帧才会发吹气命令
+//   0  = 不启用帧激活（任何帧都吹）
+//   N  = 本帧总命中像素数 < N 时，整帧抑制（屏蔽斑点误吹）
+//   推荐起步: 5
+extern int g_frameActivateThreshold;
 // 总飞行时间（ms）：物料从相机视野中心 → 喷阀位置的预估时间
 //   按帧补偿后，elapsed 范围会扩大，需要比批中点模式更大的值
 //   推荐 45ms（按帧模式下的典型值）

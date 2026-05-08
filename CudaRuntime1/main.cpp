@@ -185,15 +185,17 @@ Restart:
     //                      2 = 至少 2 个像素命中才吹（中等抗噪）
     //                      3 = 全部 3 个像素都命中（最严格）
     // ============================================================
-    g_totalDelay = 38;   // ← 总飞行时间（ms），按物理飞行时间调
-    g_valveThreshold = 1;    // ← 阀触发阈值（任意 1 像素命中就吹）
-    g_centerValveInflate = 1;    // ← 中间阀膨胀（默认 2）
-    g_valveCooldownMs = 30;   // ← 阀冷却期（ms）—— 等于 g_duration
-    std::cout << "[Mode] v2.4 按帧 + 膨胀 + 冷却"
+    g_totalDelay = 38;
+    g_valveThreshold = 3;
+    g_centerValveInflate = 0;
+    g_valveThresholdRatio = 75;          // 75% 比例阈值
+    g_frameActivateThreshold = 5;        // ★ v3.3 新增：帧激活阈值（< 5 像素的帧整帧不吹）
+
+    std::cout << "[Mode] v3.3 按帧 + 比例阈值 + 帧激活"
         << "  g_totalDelay=" << g_totalDelay << "ms"
-        << "  g_valveThreshold=" << g_valveThreshold
+        << "  g_valveThresholdRatio=" << g_valveThresholdRatio << "%"
+        << "  g_frameActivateThreshold=" << g_frameActivateThreshold
         << "  g_centerValveInflate=" << g_centerValveInflate
-        << "  g_valveCooldownMs=" << g_valveCooldownMs << "ms"
         << std::endl;
 
     // 6) 初始化阀控（打开串口 + 启动时建阀号映射表）
@@ -213,7 +215,8 @@ Restart:
     //            << " (" << aiModel.CoreList[i].TargetName << " 不剔除)" << std::endl;
     //    }
     //}
-    for (size_t i = 0; i < aiModel.CoreList.size(); i++) {
+
+    /*for (size_t i = 0; i < aiModel.CoreList.size(); i++) {
         int classid = aiModel.CoreList[i].classid;
         if (classid >= 1 && classid <= 12) {
             sel_type[classid - 1] = 1;
@@ -221,7 +224,23 @@ Restart:
                 << "] = 1  (classid=" << classid
                 << " " << aiModel.CoreList[i].TargetName << " 将被剔除)" << std::endl;
         }
+    }*/
+    for (size_t i = 0; i < aiModel.CoreList.size(); i++) {
+        int classid = aiModel.CoreList[i].classid;
+        if (classid == 1) {                          // ← 只剔除 classid=1
+            sel_type[classid - 1] = 1;
+            std::cout << "[Auto] sel_type[" << (classid - 1)
+                << "] = 1  (classid=" << classid
+                << " " << aiModel.CoreList[i].TargetName << " 将被剔除)" << std::endl;
+        }
+        else {
+            std::cout << "[Auto] 跳过 classid=" << classid
+                << " (" << aiModel.CoreList[i].TargetName << " 不剔除)" << std::endl;
+        }
     }
+    //// ===== 强制写死（保证 sel_type 是这个值）=====
+    //sel_type[0] = 1;   // classid=1 剔除
+    //sel_type[1] = 0;   // classid=2 不剔除
     // v2 已不再使用 percent[] 和 fa_ctl，留空即可
     // ============================================================
 
