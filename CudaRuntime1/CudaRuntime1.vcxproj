@@ -98,6 +98,7 @@
   <ItemGroup>
     <CudaCompile Include="Eject.cpp" />
     <CudaCompile Include="kernel.cu" />
+    <CudaCompile Include="UnifyProcessor.cu" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="CalibrationInfo.h" />
@@ -106,8 +107,9 @@
     <ClInclude Include="kernel.h" />
     <ClInclude Include="LockFreeQueue.h" />
     <ClInclude Include="AIModel.h" />
+    <ClInclude Include="Perflog.h" />
     <ClInclude Include="PlsAI.h" />
-
+    <ClInclude Include="Unifyprocessor.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="CalibrationInfo.cpp" />
@@ -115,8 +117,9 @@
     <ClCompile Include="LockFreeQueue.cpp" />
     <ClCompile Include="AIModel.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="Perflog.cpp" />
     <ClCompile Include="PlsAI.cpp" />
-
+    <ClCompile Include="Unifyprocessor.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />

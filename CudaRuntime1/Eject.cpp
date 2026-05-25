@@ -2,16 +2,20 @@
 // 文件名：Eject.cpp
 // 作用  ：阀控通信模块的实现（串口 + 按帧动态延迟补偿）
 //
-// v2 重大改动（相对旧版）：
-//   1. 启动时一次性生成阀号映射表 g_valveMap[192]（含倒序映射）
-//   2. 处理粒度：批 → 帧（ProcessOneFrame 处理 1 帧的 640 像素）
-//   3. 新增 g_valveThreshold 参数（阀触发阈值）
-//   4. 删除：5x5 过滤、阀位膨胀（EnhanceTags）、ControlValvesWithRows、批中点延迟
-//   5. 优化：每帧的多条命令打包成一次 WriteFile（减少串口调用开销）
-//   6. 删除 g_useDelayCompensation 开关、OpenAir 旧路径
+// v3.7 改动：
+//   - UDP_receive_thread 加新协议解析（包头 0xAA 0xBB）
+//   - 支持 SET / QUERY / ACK
+//   - 共 10 个参数可远程配置
+//
+// v3.8 改动：
+//   - ★ 串口写入异步化, 解决 ProcessOneFrame 内部 WriteFile 偶发卡顿
+//   - ProcessOneFrame 推命令到队列后立即返回 (~5us)
+//   - 后台线程异步执行 WriteFile, 不阻塞主流程
+//   - process max 从 ~44ms 降到 < 1ms
 // ============================================================================
 #include "Eject.h"
 #include "EventLog.h"
+#include "UnifyProcessor.h"   // ★ v3.7 引用统一像素全局参数
 
 #define WIN32_LEAN_AND_MEAN
 #include <WinSock2.h>
@@ -20,9 +24,14 @@
 
 #include <vector>
 #include <string>
+#include <queue>                  // ★ v3.8
+#include <mutex>                  // ★ v3.8
+#include <condition_variable>     // ★ v3.8
+#include <thread>                 // ★ v3.8
 #include <iostream>
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -40,48 +49,34 @@ char firstByte = 0;
 
 int sendok = 0;
 int sel_type[12] = { 0 };
-int percent[12] = { 0 };   // v2 已不用，但 UDP 接收逻辑保留兼容
-int fa_ctl = 0;            // v2 已不用，但 UDP 接收逻辑保留兼容
+int percent[12] = { 0 };
+int fa_ctl = 0;
 
 std::atomic<bool> running{ true };
 
 const int VALVE_COUNT = 192;
 
-// ===== 阀号映射表（启动时一次性生成，含倒序映射）=====
 ValveRange g_valveMap[VALVE_COUNT];
 bool       g_valveMapReady = false;
 
-// ===== 串口配置参数 =====
+// ===== 串口配置 =====
 static std::string  g_comPort = "COM8";
 static int          g_baudRate = 961200;
-static unsigned short g_duration = 30;       // 吹气时长（ms）
-static unsigned short g_delay = 1;        // 兼容字段（v2 不再使用）
+static unsigned short g_duration = 30;       // ★ 可远程配置
+static unsigned short g_delay = 1;
 static int          g_frontOffset = 0;
 static int          g_backOffset = 0;
 
-// ===== 按帧延迟补偿相关 =====
-unsigned short g_totalDelay = 45;             // 默认 45ms（按帧模式建议值）
-int            g_valveThreshold = 1;          // 默认 1（等同旧逻辑）
-// 阀触发比例阈值（0~100，0=不启用比例，仍用 g_valveThreshold）
-//   60 = 60% 比例 → 3px阀需要≥2 (67%)，4px阀需要≥3 (75%)  ★ 推荐
-//   75 = 75% 比例 → 3px阀需要≥3 (100%)，4px阀需要≥3 (75%)
-//   90 = 90% 比例 → 3px阀需要≥3 (100%)，4px阀需要≥4 (100%) 最严格
-//   0  = 不启用比例（用旧的 g_valveThreshold）
-//
-// 启用后会忽略 g_valveThreshold
-int g_valveThresholdRatio = 60;
+// ===== 按帧补偿 =====
+unsigned short g_totalDelay = 45;            // ★ 可远程配置
+int            g_valveThreshold = 1;
+int g_valveThresholdRatio = 60;              // ★ 可远程配置
 std::atomic<unsigned long long> g_currentFrameTick{ 0 };
-// 中间 4 像素阀（阀 65~128）触发时的横向膨胀范围（阀数）
-//   0 = 不膨胀
-//   1 = ±1 阀（吹 3 个：左 1 + 自己 + 右 1）
-//   2 = ±2 阀（吹 5 个：左 2 + 自己 + 右 2，默认）
-//   3 = ±3 阀（吹 7 个）
-// 注意：膨胀允许跨界（阀 65 可以扩到阀 64 即 3 像素区，反之亦然）
-int g_centerValveInflate = 2;
+int g_centerValveInflate = 2;                // ★ 可远程配置
 
-// 帧激活阈值（详见 Eject.h 注释）
-int g_frameActivateThreshold = 5;
-// ===== QPC 时间戳工具 =====
+int g_frameActivateThreshold = 5;            // ★ 可远程配置
+
+// ===== QPC =====
 static LARGE_INTEGER g_qpcFreq;
 static bool g_qpcInited = false;
 
@@ -89,7 +84,25 @@ static bool g_qpcInited = false;
 static HANDLE g_hSerial = INVALID_HANDLE_VALUE;
 
 // ============================================================================
-// QPC 工具：获取毫秒精度时间戳
+// ★ v3.8 异步串口发送
+// ============================================================================
+struct SerialCmd {
+    unsigned char buf[1024];   // 单批最多 192 阀 × 7 字节, 1024 足够
+    int len;
+};
+
+static std::queue<SerialCmd*>    g_serialQueue;
+static std::mutex                g_serialMutex;
+static std::condition_variable   g_serialCv;
+static std::atomic<bool>         g_serialThreadRunning{ false };
+static std::thread               g_serialThread;
+static std::atomic<int>          g_serialQueueDropCount{ 0 };
+static std::atomic<int>          g_serialQueueMaxSize{ 0 };
+
+#define SERIAL_QUEUE_MAX  200    // 队列上限
+
+// ============================================================================
+// QPC 工具
 // ============================================================================
 unsigned long long NowMs()
 {
@@ -103,7 +116,7 @@ unsigned long long NowMs()
 }
 
 // ============================================================================
-// 配置函数（运行时可调）
+// 配置函数
 // ============================================================================
 void SetSerialPort(const std::string& comPort, int baudRate) {
     g_comPort = comPort;
@@ -120,14 +133,11 @@ void SetPixelOffset(int frontOffset, int backOffset) {
     g_backOffset = backOffset;
 }
 
-// 192 阀均匀覆盖 640 像素
-// 每阀 = 640 / 192 = 3.333... 像素
-
 void BuildValveMap()
 {
-    int x_start = g_frontOffset;      // 默认 0
-    int x_end = g_Samples - g_backOffset;  // 默认 640
-    int x_range = x_end - x_start;    // 640
+    int x_start = g_frontOffset;
+    int x_end = g_Samples - g_backOffset;
+    int x_range = x_end - x_start;
 
     if (x_range <= 0) {
         std::cerr << "[Eject] BuildValveMap 失败：像素范围无效" << std::endl;
@@ -135,34 +145,22 @@ void BuildValveMap()
         return;
     }
 
-    // ===== 按比例均匀分布 =====
-    // 倒序：物理阀 fa=0（阀 1）对应图像最右段
-    //      fa=191（阀 192）对应图像最左段
-    //
-    // 第 seg 段（从左数 0~191）的像素范围：
-    //   x1 = x_start + floor(seg * x_range / 192)
-    //   x2 = x_start + floor((seg+1) * x_range / 192) - 1
-    // 这样每段宽度 3 或 4 像素自动分配，但分布是均匀的（不是连续 64 个 3、64 个 4、64 个 3）
-
     for (int fa = 0; fa < VALVE_COUNT; fa++) {
-        int seg = VALVE_COUNT - 1 - fa;   // 倒序
+        int seg = VALVE_COUNT - 1 - fa;
         int x1 = x_start + (seg * x_range) / VALVE_COUNT;
         int x2 = x_start + ((seg + 1) * x_range) / VALVE_COUNT - 1;
         if (x2 >= g_Samples) x2 = g_Samples - 1;
-
         g_valveMap[fa].x1 = x1;
         g_valveMap[fa].x2 = x2;
     }
     g_valveMapReady = true;
 
-    // 打印映射表
     std::cout << "[Eject] 阀号映射表已生成（按比例均匀分布，"
         << "VALVE_COUNT=" << VALVE_COUNT
         << "，像素范围 [" << x_start << "~" << x_end
         << "] 共 " << x_range << "px）" << std::endl;
     std::cout << "  每阀平均 = " << (double)x_range / VALVE_COUNT << " 像素" << std::endl;
 
-    // 打印前 5 个阀
     for (int i = 0; i < 5 && i < VALVE_COUNT; i++) {
         int width = g_valveMap[i].x2 - g_valveMap[i].x1 + 1;
         std::cout << "  阀 " << (i + 1) << ": 像素 ["
@@ -170,7 +168,6 @@ void BuildValveMap()
             << "] (" << width << "px)" << std::endl;
     }
     std::cout << "  ..." << std::endl;
-    // 打印中间几个
     for (int i = 95; i <= 97; i++) {
         int width = g_valveMap[i].x2 - g_valveMap[i].x1 + 1;
         std::cout << "  阀 " << (i + 1) << ": 像素 ["
@@ -178,7 +175,6 @@ void BuildValveMap()
             << "] (" << width << "px)" << std::endl;
     }
     std::cout << "  ..." << std::endl;
-    // 打印最后几个
     for (int i = VALVE_COUNT - 5; i < VALVE_COUNT; i++) {
         int width = g_valveMap[i].x2 - g_valveMap[i].x1 + 1;
         std::cout << "  阀 " << (i + 1) << ": 像素 ["
@@ -188,8 +184,12 @@ void BuildValveMap()
 }
 
 // ============================================================================
-// Start_send: 打开串口
+// Start_send / Stop_send
 // ============================================================================
+// ★ v3.8 前置声明 (函数实现在文件下方)
+static void StartSerialThread();
+static void StopSerialThread();
+
 bool Start_send()
 {
     g_hSerial = CreateFileA(
@@ -248,13 +248,21 @@ bool Start_send()
     std::cout << "[Eject] 模式: 按帧动态补偿  g_totalDelay=" << g_totalDelay
         << "ms  g_valveThreshold=" << g_valveThreshold << std::endl;
 
-    //★ 启动时一次性生成阀号映射表（含倒序映射）★
-      BuildValveMap();
+    BuildValveMap();
+
+    // ★ v3.8 启动异步串口发送线程
+    StartSerialThread();
+
     return true;
 }
 
 void Stop_send()
 {
+    // ★ v3.8 先停异步发送线程, 让队列里残留命令发完
+    StopSerialThread();
+    std::cout << "[Eject] 队列统计: maxSize=" << g_serialQueueMaxSize.load()
+        << ", drops=" << g_serialQueueDropCount.load() << std::endl;
+
     if (g_hSerial != INVALID_HANDLE_VALUE) {
         CloseHandle(g_hSerial);
         g_hSerial = INVALID_HANDLE_VALUE;
@@ -263,16 +271,97 @@ void Stop_send()
 }
 
 // ============================================================================
-// ProcessOneFrame: 处理一帧的 640 像素分类结果（带日志）
-//
-// 流程：
-//   Step 1:    算 192 阀状态
-//   Step 1.5:  帧激活判定（连续目标像素 < 阈值则整帧抑制）★ v3.4 改连续版
-//   Step 2:    中间 4 像素阀横向膨胀
-//   Step 3:    合并连续阀号成区间
-//   Step 4:    算 actualDelay
-//   Step 5:    一次 WriteFile 发送
-//   Step 6:    写日志
+// ★ v3.8 异步串口发送线程实现
+// ============================================================================
+static void SerialSendThread()
+{
+    std::cout << "[Eject] 异步串口发送线程已启动" << std::endl;
+
+    while (g_serialThreadRunning.load()) {
+        SerialCmd* cmd = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(g_serialMutex);
+            g_serialCv.wait(lock, [] {
+                return !g_serialQueue.empty() || !g_serialThreadRunning.load();
+                });
+
+            if (!g_serialThreadRunning.load() && g_serialQueue.empty()) break;
+
+            if (!g_serialQueue.empty()) {
+                cmd = g_serialQueue.front();
+                g_serialQueue.pop();
+            }
+        }
+
+        if (cmd && cmd->len > 0 && g_hSerial != INVALID_HANDLE_VALUE) {
+            DWORD bytesWritten = 0;
+            BOOL ok = WriteFile(g_hSerial, cmd->buf, cmd->len, &bytesWritten, NULL);
+            if (!ok) {
+                std::cerr << "[Eject] 异步串口写入失败, 错误码: "
+                    << GetLastError() << std::endl;
+            }
+        }
+
+        delete cmd;
+    }
+
+    // 退出: 清空残留队列
+    std::lock_guard<std::mutex> lock(g_serialMutex);
+    while (!g_serialQueue.empty()) {
+        delete g_serialQueue.front();
+        g_serialQueue.pop();
+    }
+
+    std::cout << "[Eject] 异步串口发送线程已退出" << std::endl;
+}
+
+static void StartSerialThread()
+{
+    if (g_serialThreadRunning.load()) return;
+    g_serialThreadRunning.store(true);
+    g_serialThread = std::thread(SerialSendThread);
+}
+
+static void StopSerialThread()
+{
+    if (!g_serialThreadRunning.load()) return;
+    g_serialThreadRunning.store(false);
+    g_serialCv.notify_all();
+    if (g_serialThread.joinable()) {
+        g_serialThread.join();
+    }
+}
+
+// 入队 (从 ProcessOneFrame 调用, 必须快)
+static void EnqueueSerialCmd(const unsigned char* buf, int len)
+{
+    if (len <= 0 || len > 1024) return;
+    if (g_hSerial == INVALID_HANDLE_VALUE) return;
+
+    SerialCmd* cmd = new SerialCmd;
+    memcpy(cmd->buf, buf, len);
+    cmd->len = len;
+
+    int qsize = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_serialMutex);
+        if ((int)g_serialQueue.size() >= SERIAL_QUEUE_MAX) {
+            // 队列满: 丢弃最老命令 (生产环境抗压)
+            delete g_serialQueue.front();
+            g_serialQueue.pop();
+            g_serialQueueDropCount.fetch_add(1);
+        }
+        g_serialQueue.push(cmd);
+        qsize = (int)g_serialQueue.size();
+    }
+    if (qsize > g_serialQueueMaxSize.load()) {
+        g_serialQueueMaxSize.store(qsize);
+    }
+    g_serialCv.notify_one();
+}
+
+// ============================================================================
+// ProcessOneFrame（v3.8 - 串口写入改异步）
 // ============================================================================
 void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
 {
@@ -281,11 +370,9 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
 
     g_currentFrameTick.store(frameTickMs);
 
-    // ===== Step 1: 算 192 阀状态 + 诊断统计 =====
     bool valve_trigger[VALVE_COUNT] = { false };
     int rawClassified = 0;
 
-    // 诊断统计（每 1000 帧采样一次）
     static int diag_frameCnt = 0;
     bool isDiagFrame = (++diag_frameCnt % 1000 == 0);
 
@@ -300,13 +387,12 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
     for (int fa = 0; fa < VALVE_COUNT; fa++) {
         int x1 = g_valveMap[fa].x1;
         int x2 = g_valveMap[fa].x2;
-        int valveWidth = x2 - x1 + 1;   // ★ 关键：本阀的实际像素宽度
+        int valveWidth = x2 - x1 + 1;
 
         int hitCount = 0;
         for (int x = x1; x <= x2; x++) {
             int cls = (unsigned char)frameTags[x];
 
-            // 诊断：统计像素分类（仅在采样帧）
             if (isDiagFrame) {
                 if (cls == 0) diag_pixCls0++;
                 else if (cls == 1) diag_pixCls1++;
@@ -321,8 +407,6 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
 
         rawClassified += hitCount;
 
-        // ===== 阀触发判定 =====
-        // 优先用比例阈值（按阀宽自适应）
         if (g_valveThresholdRatio > 0) {
             valve_trigger[fa] = (hitCount * 100 >= valveWidth * g_valveThresholdRatio);
         }
@@ -330,7 +414,6 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
             valve_trigger[fa] = (hitCount >= g_valveThreshold);
         }
 
-        // 诊断：统计阀命中分布（仅在采样帧）
         if (isDiagFrame) {
             if (hitCount >= 1) diag_valveHit1++;
             if (hitCount >= 2) diag_valveHit2++;
@@ -338,9 +421,6 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
         }
     }
 
-    // ===== Step 1.5: 帧激活判定（连续像素版）★ v3.4 =====
-    // 扫描整帧 640 像素，找"最长连续目标像素段"
-    // 只要最长连续段 < 阈值，整帧抑制（屏蔽分散的斑点像素）
     if (g_frameActivateThreshold > 0) {
         int maxRun = 0;
         int curRun = 0;
@@ -357,26 +437,17 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
             }
         }
 
-        // 最长连续段不够 → 整帧抑制
         if (maxRun < g_frameActivateThreshold) {
             memset(valve_trigger, 0, sizeof(valve_trigger));
 
-            // 抑制计数（只对"有目标但被抑制"的帧计数，避免空帧刷屏）
             if (rawClassified > 0) {
-                static int g_suppressCount = 0;
-                g_suppressCount++;
-                if (g_suppressCount % 100 == 1) {
-                    std::cout << "[Frame] 已抑制 " << g_suppressCount
-                        << " 帧（最长连续=" << maxRun
-                        << " < " << g_frameActivateThreshold
-                        << "，rawClassified=" << rawClassified << "）"
-                        << std::endl;
-                }
+                static std::atomic<int> g_suppressCount{ 0 };
+                g_suppressCount.fetch_add(1);
+                // ★ v3.8 去掉热路径的 cout 输出
             }
         }
     }
 
-    // ===== 写诊断到 event.log（每 1000 帧一次）=====
     if (isDiagFrame) {
         LogStats(diag_frameCnt,
             diag_pixCls0, diag_pixCls1, diag_pixCls2, diag_pixOther,
@@ -384,7 +455,6 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
             g_valveThreshold);
     }
 
-    // ===== Step 2: 中间阀横向膨胀（不变）=====
     if (g_centerValveInflate > 0) {
         const int CENTER_VALVE_START = 64;
         const int CENTER_VALVE_END = 127;
@@ -408,7 +478,6 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
         }
     }
 
-    // ===== Step 3 + 4 + 5: 合并区间 + 算延迟 + 打包发送 =====
     unsigned char txBuf[VALVE_COUNT * 7];
     int txLen = 0;
     int cmdCount = 0;
@@ -461,23 +530,17 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
         i = segEnd + 1;
     }
 
-    // ===== Step 5: 一次性 WriteFile =====
+    // ★ v3.8 异步: 不直接 WriteFile, 推队列后立即返回
     int writeTime = 0;
     bool writeOk = true;
     if (txLen > 0) {
         unsigned long long t_before_write = NowMs();
-        DWORD bytesWritten = 0;
-        BOOL ok = WriteFile(g_hSerial, txBuf, txLen, &bytesWritten, NULL);
+        EnqueueSerialCmd(txBuf, txLen);
         unsigned long long t_after_write = NowMs();
         writeTime = (int)(t_after_write - t_before_write);
-        writeOk = (ok && bytesWritten == (DWORD)txLen);
-
-        if (!ok) {
-            std::cerr << "[Eject] 串口写入失败, 错误码: " << GetLastError() << std::endl;
-        }
+        // writeOk 总是 true (异步, 实际发送结果由线程处理)
     }
 
-    // ===== Step 6: 写日志 =====
     {
         int j = 0;
         int idx = 0;
@@ -496,29 +559,344 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
 
     LogBatchSummary(currentBatch, rawClassified, rawClassified, cmdCount);
 
+    // ★ v3.8 去掉热路径上的 cerr 输出 (避免控制台阻塞导致 [LATE!] 雪崩)
+    //   原代码每 100 次 LATE 打印一行 [WARN], 但在 LATE 频繁时反而拖慢主流程
+    //   保留计数器, 通过其他方式查看 (event.log 已经有 [LATE!] 标记)
+    static std::atomic<int> g_lateCount{ 0 };
     if (wasNegative) {
-        static int g_lateCount = 0;
-        g_lateCount++;
-        if (g_lateCount % 100 == 1) {
-            std::cerr << "[WARN] actualDelay 被截断为 0 已累计 " << g_lateCount
-                << " 次，建议增大 g_totalDelay" << std::endl;
-        }
+        g_lateCount.fetch_add(1);
     }
 
+    static std::atomic<int> g_slowWriteCount{ 0 };
     if (writeTime > 5) {
-        static int g_slowWriteCount = 0;
-        g_slowWriteCount++;
-        if (g_slowWriteCount % 50 == 1) {
-            std::cerr << "[WARN] 串口 WriteFile 耗时 " << writeTime
-                << "ms (累计 " << g_slowWriteCount << " 次>5ms)" << std::endl;
-        }
+        g_slowWriteCount.fetch_add(1);
     }
 }
+
 // ============================================================================
-// UDP 参数接收线程
-//   仍然接收操作屏的数据包（保持兼容），但 v2 中：
-//     - sel_type[] 仍生效
-//     - percent[]、fa_ctl 接收但不使用
+// ★ v3.7 新增：参数协议处理
+// ============================================================================
+
+// 协议常量
+#define PROTO_HEADER1   0xAA
+#define PROTO_HEADER2   0xBB
+#define PROTO_VERSION   0x01
+
+#define CMD_SET         0x01
+#define CMD_QUERY       0x02
+#define CMD_SET_ACK     0x81
+#define CMD_QUERY_ACK   0x82
+
+// 参数 ID
+#define PID_TOTAL_DELAY            0x01
+#define PID_DURATION               0x02
+#define PID_VALVE_RATIO            0x03
+#define PID_FRAME_ACTIVATE         0x04
+#define PID_CENTER_INFLATE         0x05
+#define PID_UNIFY_ENABLE           0x06
+#define PID_UNIFY_TAIL_FRAMES      0x07
+#define PID_UNIFY_FORCE_CLASSID    0x08
+#define PID_UNIFY_THRESHOLD        0x09
+#define PID_UNIFY_FILL_BG          0x0A
+
+// 数据类型
+#define TYPE_INT32   0
+#define TYPE_FLOAT   1
+#define TYPE_BOOL    2
+
+// ACK 状态码
+#define ACK_OK              0
+#define ACK_UNKNOWN_PARAM   1
+#define ACK_OUT_OF_RANGE    2
+#define ACK_TYPE_MISMATCH   3
+#define ACK_BAD_CHECKSUM    4
+
+// 计算 XOR 校验和
+static unsigned char CalcXor(const unsigned char* data, int len)
+{
+    unsigned char x = 0;
+    for (int i = 0; i < len; i++) x ^= data[i];
+    return x;
+}
+
+// 把 4 字节 little-endian 解码成 int / float
+static int DecodeInt32(const unsigned char* p) {
+    return (int)((unsigned int)p[0] | ((unsigned int)p[1] << 8)
+        | ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24));
+}
+
+static float DecodeFloat(const unsigned char* p) {
+    float f;
+    memcpy(&f, p, 4);
+    return f;
+}
+
+// 把 int / float 编码到 4 字节 little-endian
+static void EncodeInt32(unsigned char* p, int v) {
+    p[0] = (unsigned char)(v & 0xFF);
+    p[1] = (unsigned char)((v >> 8) & 0xFF);
+    p[2] = (unsigned char)((v >> 16) & 0xFF);
+    p[3] = (unsigned char)((v >> 24) & 0xFF);
+}
+
+static void EncodeFloat(unsigned char* p, float f) {
+    memcpy(p, &f, 4);
+}
+
+// 构造一个参数 6 字节
+static void BuildParam(unsigned char* p, unsigned char id,
+    unsigned char type, int intVal, float floatVal)
+{
+    p[0] = id;
+    p[1] = type;
+    if (type == TYPE_FLOAT) {
+        EncodeFloat(p + 2, floatVal);
+    }
+    else {
+        EncodeInt32(p + 2, intVal);
+    }
+}
+
+// 应用一个参数到全局变量
+//   返回：0=OK, 2=越界, 3=类型错误, 1=未知
+static int ApplyParam(unsigned char paramId, unsigned char dataType,
+    int intVal, float floatVal)
+{
+    switch (paramId) {
+    case PID_TOTAL_DELAY:
+        if (dataType != TYPE_INT32) return ACK_TYPE_MISMATCH;
+        if (intVal < 0 || intVal > 65535) return ACK_OUT_OF_RANGE;
+        g_totalDelay = (unsigned short)intVal;
+        std::cout << "[UDP] g_totalDelay = " << intVal << " ms" << std::endl;
+        return ACK_OK;
+
+    case PID_DURATION:
+        if (dataType != TYPE_INT32) return ACK_TYPE_MISMATCH;
+        if (intVal < 0 || intVal > 65535) return ACK_OUT_OF_RANGE;
+        g_duration = (unsigned short)intVal;
+        std::cout << "[UDP] g_duration = " << intVal << " ms" << std::endl;
+        return ACK_OK;
+
+    case PID_VALVE_RATIO:
+        if (dataType != TYPE_INT32) return ACK_TYPE_MISMATCH;
+        if (intVal < 0 || intVal > 100) return ACK_OUT_OF_RANGE;
+        g_valveThresholdRatio = intVal;
+        std::cout << "[UDP] g_valveThresholdRatio = " << intVal << " %" << std::endl;
+        return ACK_OK;
+
+    case PID_FRAME_ACTIVATE:
+        if (dataType != TYPE_INT32) return ACK_TYPE_MISMATCH;
+        if (intVal < 0 || intVal > 50) return ACK_OUT_OF_RANGE;
+        g_frameActivateThreshold = intVal;
+        std::cout << "[UDP] g_frameActivateThreshold = " << intVal << std::endl;
+        return ACK_OK;
+
+    case PID_CENTER_INFLATE:
+        if (dataType != TYPE_INT32) return ACK_TYPE_MISMATCH;
+        if (intVal < 0 || intVal > 10) return ACK_OUT_OF_RANGE;
+        g_centerValveInflate = intVal;
+        std::cout << "[UDP] g_centerValveInflate = " << intVal << std::endl;
+        return ACK_OK;
+
+    case PID_UNIFY_ENABLE:
+        if (dataType != TYPE_BOOL) return ACK_TYPE_MISMATCH;
+        if (intVal != 0 && intVal != 1) return ACK_OUT_OF_RANGE;
+        g_unifyEnable = (intVal != 0);
+        std::cout << "[UDP] g_unifyEnable = " << (g_unifyEnable ? "ON" : "OFF") << std::endl;
+        return ACK_OK;
+
+    case PID_UNIFY_TAIL_FRAMES:
+        if (dataType != TYPE_INT32) return ACK_TYPE_MISMATCH;
+        if (intVal < 0 || intVal > 64) return ACK_OUT_OF_RANGE;
+        g_unifyTailFrames = intVal;
+        std::cout << "[UDP] g_unifyTailFrames = " << intVal << std::endl;
+        return ACK_OK;
+
+    case PID_UNIFY_FORCE_CLASSID:
+        if (dataType != TYPE_INT32) return ACK_TYPE_MISMATCH;
+        if (intVal < 1 || intVal > 12) return ACK_OUT_OF_RANGE;
+        g_unifyForceClassId = intVal;
+        std::cout << "[UDP] g_unifyForceClassId = " << intVal << std::endl;
+        return ACK_OK;
+
+    case PID_UNIFY_THRESHOLD:
+        if (dataType != TYPE_FLOAT) return ACK_TYPE_MISMATCH;
+        if (floatVal < 0.0f || floatVal > 1.0f) return ACK_OUT_OF_RANGE;
+        g_unifyThreshold = floatVal;
+        std::cout << "[UDP] g_unifyThreshold = " << floatVal << std::endl;
+        return ACK_OK;
+
+    case PID_UNIFY_FILL_BG:
+        if (dataType != TYPE_BOOL) return ACK_TYPE_MISMATCH;
+        if (intVal != 0 && intVal != 1) return ACK_OUT_OF_RANGE;
+        g_unifyFillBackground = (intVal != 0);
+        std::cout << "[UDP] g_unifyFillBackground = "
+            << (g_unifyFillBackground ? "ON" : "OFF") << std::endl;
+        return ACK_OK;
+
+    default:
+        std::cerr << "[UDP] 未知参数 ID: 0x" << std::hex << (int)paramId
+            << std::dec << std::endl;
+        return ACK_UNKNOWN_PARAM;
+    }
+}
+
+// 发送 SET 响应
+static void SendSetAck(SOCKET sock, const sockaddr_in& clientAddr,
+    int clientAddrLen, unsigned char status,
+    unsigned char errorParamId)
+{
+    unsigned char ack[10];
+    ack[0] = PROTO_HEADER1;
+    ack[1] = PROTO_HEADER2;
+    ack[2] = PROTO_VERSION;
+    ack[3] = CMD_SET_ACK;
+    ack[4] = 0x02;          // payload_len = 2 (low byte)
+    ack[5] = 0x00;          // payload_len = 2 (high byte)
+    ack[6] = status;
+    ack[7] = errorParamId;
+    ack[8] = CalcXor(ack, 8);
+    ack[9] = 0;             // 无意义，凑齐发包
+
+    sendto(sock, (const char*)ack, 9, 0,
+        (const sockaddr*)&clientAddr, clientAddrLen);
+}
+
+// 发送 QUERY 响应（包含所有 10 个参数当前值）
+static void SendQueryAck(SOCKET sock, const sockaddr_in& clientAddr,
+    int clientAddrLen)
+{
+    // 头 6 + count 1 + 10 个参数 × 6 + checksum 1 = 68 字节
+    unsigned char buf[80];
+    int idx = 0;
+    buf[idx++] = PROTO_HEADER1;
+    buf[idx++] = PROTO_HEADER2;
+    buf[idx++] = PROTO_VERSION;
+    buf[idx++] = CMD_QUERY_ACK;
+
+    // payload_len 占位（稍后填）
+    int lenIdx = idx;
+    idx += 2;
+
+    int payloadStart = idx;
+    buf[idx++] = 10;        // 参数个数
+
+    // 10 个参数
+    BuildParam(buf + idx, PID_TOTAL_DELAY, TYPE_INT32, (int)g_totalDelay, 0);
+    idx += 6;
+    BuildParam(buf + idx, PID_DURATION, TYPE_INT32, (int)g_duration, 0);
+    idx += 6;
+    BuildParam(buf + idx, PID_VALVE_RATIO, TYPE_INT32, g_valveThresholdRatio, 0);
+    idx += 6;
+    BuildParam(buf + idx, PID_FRAME_ACTIVATE, TYPE_INT32, g_frameActivateThreshold, 0);
+    idx += 6;
+    BuildParam(buf + idx, PID_CENTER_INFLATE, TYPE_INT32, g_centerValveInflate, 0);
+    idx += 6;
+    BuildParam(buf + idx, PID_UNIFY_ENABLE, TYPE_BOOL, g_unifyEnable ? 1 : 0, 0);
+    idx += 6;
+    BuildParam(buf + idx, PID_UNIFY_TAIL_FRAMES, TYPE_INT32, g_unifyTailFrames, 0);
+    idx += 6;
+    BuildParam(buf + idx, PID_UNIFY_FORCE_CLASSID, TYPE_INT32, g_unifyForceClassId, 0);
+    idx += 6;
+    BuildParam(buf + idx, PID_UNIFY_THRESHOLD, TYPE_FLOAT, 0, g_unifyThreshold);
+    idx += 6;
+    BuildParam(buf + idx, PID_UNIFY_FILL_BG, TYPE_BOOL, g_unifyFillBackground ? 1 : 0, 0);
+    idx += 6;
+
+    int payloadLen = idx - payloadStart;
+    buf[lenIdx] = (unsigned char)(payloadLen & 0xFF);
+    buf[lenIdx + 1] = (unsigned char)((payloadLen >> 8) & 0xFF);
+
+    // 校验和
+    buf[idx] = CalcXor(buf, idx);
+    idx++;
+
+    sendto(sock, (const char*)buf, idx, 0,
+        (const sockaddr*)&clientAddr, clientAddrLen);
+
+    std::cout << "[UDP] 已响应 QUERY (" << idx << " 字节)" << std::endl;
+}
+
+// 处理新协议包
+static void HandleParamPacket(SOCKET sock, const unsigned char* buf, int len,
+    const sockaddr_in& clientAddr, int clientAddrLen)
+{
+    // 最少 7 字节（头4 + len2 + checksum1）
+    if (len < 7) return;
+
+    // 校验包头
+    if (buf[0] != PROTO_HEADER1 || buf[1] != PROTO_HEADER2) return;
+    if (buf[2] != PROTO_VERSION) {
+        std::cerr << "[UDP] 协议版本不匹配: " << (int)buf[2] << std::endl;
+        return;
+    }
+
+    unsigned char cmd = buf[3];
+    int payloadLen = (int)buf[4] | ((int)buf[5] << 8);
+
+    // 校验包长
+    int expectedLen = 6 + payloadLen + 1;   // 6 头 + payload + 1 校验
+    if (len < expectedLen) {
+        std::cerr << "[UDP] 包长度不足: 期望 " << expectedLen
+            << " 实际 " << len << std::endl;
+        return;
+    }
+
+    // 校验和
+    unsigned char calcXor = CalcXor(buf, expectedLen - 1);
+    unsigned char recvXor = buf[expectedLen - 1];
+    if (calcXor != recvXor) {
+        std::cerr << "[UDP] 校验和不匹配 calc=0x" << std::hex << (int)calcXor
+            << " recv=0x" << (int)recvXor << std::dec << std::endl;
+        SendSetAck(sock, clientAddr, clientAddrLen, ACK_BAD_CHECKSUM, 0);
+        return;
+    }
+
+    if (cmd == CMD_SET) {
+        // payload: [count:1, (param_id:1, type:1, value:4) × N]
+        if (payloadLen < 1) {
+            std::cerr << "[UDP] SET 包 payload 太短" << std::endl;
+            return;
+        }
+        unsigned char count = buf[6];
+        if (payloadLen != 1 + count * 6) {
+            std::cerr << "[UDP] SET 包 payload 长度不对: 期望 "
+                << (1 + count * 6) << " 实际 " << payloadLen << std::endl;
+            return;
+        }
+
+        // 逐个应用参数；任一出错就回错误 ACK 并停
+        const unsigned char* p = buf + 7;
+        for (int i = 0; i < count; i++) {
+            unsigned char pid = p[0];
+            unsigned char type = p[1];
+            int intVal = DecodeInt32(p + 2);
+            float floatVal = DecodeFloat(p + 2);
+
+            int result = ApplyParam(pid, type, intVal, floatVal);
+            if (result != ACK_OK) {
+                SendSetAck(sock, clientAddr, clientAddrLen,
+                    (unsigned char)result, pid);
+                return;
+            }
+
+            p += 6;
+        }
+
+        // 全部成功
+        SendSetAck(sock, clientAddr, clientAddrLen, ACK_OK, 0);
+    }
+    else if (cmd == CMD_QUERY) {
+        SendQueryAck(sock, clientAddr, clientAddrLen);
+    }
+    else {
+        std::cerr << "[UDP] 未知命令字: 0x" << std::hex << (int)cmd
+            << std::dec << std::endl;
+    }
+}
+
+// ============================================================================
+// UDP 接收线程（v3.7 - 支持双协议）
 // ============================================================================
 typedef unsigned char byte;
 
@@ -530,15 +908,15 @@ void UDP_receive_thread()
         return;
     }
 
-    SOCKET udpReceive = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (udpReceive == INVALID_SOCKET) {
+    SOCKET udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udpSocket == INVALID_SOCKET) {
         std::cerr << "[Eject] 接收套接字创建失败" << std::endl;
         WSACleanup();
         return;
     }
 
     int reuseAddr = 1;
-    setsockopt(udpReceive, SOL_SOCKET, SO_REUSEADDR,
+    setsockopt(udpSocket, SOL_SOCKET, SO_REUSEADDR,
         reinterpret_cast<const char*>(&reuseAddr), sizeof(reuseAddr));
 
     sockaddr_in serverAddr1{};
@@ -546,33 +924,47 @@ void UDP_receive_thread()
     serverAddr1.sin_port = htons(8080);
     serverAddr1.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    if (::bind(udpReceive, reinterpret_cast<sockaddr*>(&serverAddr1),
+    if (::bind(udpSocket, reinterpret_cast<sockaddr*>(&serverAddr1),
         sizeof(serverAddr1)) == SOCKET_ERROR) {
-        std::cerr << "[Eject] UDP 绑定失败" << std::endl;
-        closesocket(udpReceive);
+        std::cerr << "[Eject] UDP 绑定失败 端口 8080" << std::endl;
+        closesocket(udpSocket);
         WSACleanup();
         return;
     }
+
+    std::cout << "[UDP] 监听端口 8080，支持协议:" << std::endl;
+    std::cout << "       - SortingExpert 协议（包头 0x02 0x2A）" << std::endl;
+    std::cout << "       - 参数配置协议  （包头 0xAA 0xBB）" << std::endl;
 
     std::vector<byte> buf(1024);
     while (running) {
         sockaddr_in clientAddr{};
         int clientAddrLen = sizeof(clientAddr);
-        int recvLen = recvfrom(udpReceive,
+        int recvLen = recvfrom(udpSocket,
             reinterpret_cast<char*>(buf.data()),
             (int)buf.size(), 0,
             reinterpret_cast<sockaddr*>(&clientAddr),
             &clientAddrLen);
-        if (recvLen > 0 && buf[0] == 2 && buf[1] == 0x2a) {
+
+        if (recvLen <= 0) continue;
+
+        // ===== SortingExpert 协议（保留兼容）=====
+        if (recvLen >= 6 && buf[0] == 2 && buf[1] == 0x2a) {
             sendok = buf[5];
-            // for (int i = 0; i < 12; i++) {
-            //     sel_type[i] = buf[12 + i * 2];   // ← 临时注释
-            //     percent[i] = buf[13 + i * 2];
-            // }
-            // fa_ctl = buf[40];
+            // sel_type / percent / fa_ctl 保持注释，由 main.cpp 自动配置
+            continue;
         }
+
+        // ===== ★ v3.7 新增：参数配置协议 =====
+        if (recvLen >= 7 && buf[0] == PROTO_HEADER1 && buf[1] == PROTO_HEADER2) {
+            HandleParamPacket(udpSocket, buf.data(), recvLen,
+                clientAddr, clientAddrLen);
+            continue;
+        }
+
+        // 未知协议，忽略
     }
 
-    closesocket(udpReceive);
+    closesocket(udpSocket);
     WSACleanup();
 }

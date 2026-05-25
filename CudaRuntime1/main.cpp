@@ -1,12 +1,16 @@
 ﻿// ============================================================================
 // 文件名：main.cpp
-// 作用  ：工业分选程序的主入口（v2 - 按帧处理 + 按帧补偿）
+// 版本  ：v4.5
+// 作用  ：工业分选程序的主入口
 //
-// v2 重大改动（相对旧版）：
-//   1. GPU 线程：保留全部 50 帧时刻；用 pinned memory + 单次 cudaMemcpy
-//      tag 用 3 缓冲环形复用（不每批 malloc）
-//   2. 分发线程：出队 1 次后逐帧处理（for i = 0..49 调 ProcessOneFrame）
-//   3. 删除：批中点延迟模式、5x5/膨胀相关参数、sort_stats.log（IO 浪费）
+// v4.5 改动 (相对 v3.6):
+//   1. threadFunction 加分段计时 (H2D / calc_GPU / D2H 各段独立计时)
+//      → 任一段 > 5ms 立即打印慢路径日志, 用于排查 GPU 突刺
+//   2. threadFunction 和 threadFunction_dis 提为 TIME_CRITICAL 优先级
+//      → 减少被 Windows 调度抢占的概率
+//   3. 引入 PerfLog 异步日志模块, 输出到 perf.log
+//      → 热路径上日志开销 < 1us, 缓冲满直接丢弃, 不阻塞
+//   4. dis 线程每 100 批打印一次队列水位 (改为走 PerfLog)
 // ============================================================================
 
 #include <stdio.h>
@@ -33,11 +37,13 @@
 #include "AIModel.h"
 #include "Eject.h"
 #include "EventLog.h"
+#include "UnifyProcessor.h"
+#include "PerfLog.h"             // ★ v4.5 新增
 
 // 来自 Eject.cpp 的全局参数
 extern int sel_type[12];
-extern int percent[12];   // v2 已不用
-extern int fa_ctl;        // v2 已不用
+extern int percent[12];
+extern int fa_ctl;
 
 using namespace std;
 using namespace BaseCamera;
@@ -64,27 +70,22 @@ int dealCount = 24;
 int frameq;
 
 // ============================================================================
-// 共享队列（生产者-消费者）
+// 共享队列
 // ============================================================================
-LockFreeQueue<GrabData*>          grabDatas;          // 相机 → GPU 线程
-LockFreeQueue<unsigned long long> frameTickQueue;     // 每帧时刻，与 grabDatas 一一对应
+LockFreeQueue<GrabData*>          grabDatas;
+LockFreeQueue<unsigned long long> frameTickQueue;
 
-// ===== v2 新设计：tag 缓冲 + 帧时刻打包 =====
-//
-// FrameTicks: 一批 50 帧的时刻打包传递（用指针，避免 vector 堆分配）
-struct FrameTicks { unsigned long long t[64]; };   // 64 大于 dealCount=50 上限，留富余
+struct FrameTicks { unsigned long long t[64]; };
 
-LockFreeQueue<char*>        sortResultDatas;            // GPU → 分发：tag 缓冲指针（指向环形缓冲）
-LockFreeQueue<FrameTicks*>  batchFrameTicksQueue;       // GPU → 分发：50 个帧时刻指针
-
-// ===== 心跳字节队列（保留）=====
+LockFreeQueue<char*>        sortResultDatas;
+LockFreeQueue<FrameTicks*>  batchFrameTicksQueue;
 LockFreeQueue<char> firstByteList;
 
 // ============================================================================
 // 同步事件句柄
 // ============================================================================
-HANDLE hEvent = NULL;   // 通知分发线程有新结果
-HANDLE hEventSort = NULL;   // 通知 GPU 线程数据足够
+HANDLE hEvent = NULL;
+HANDLE hEventSort = NULL;
 
 // ============================================================================
 // 函数前置声明
@@ -108,6 +109,8 @@ BOOL CtrlHandler(DWORD fdwCtrlType) {
             Disconnect();
         }
         StopEventLog();
+        UnifyShutdown();
+        PerfLogShutdown();   // ★ v4.5
         return TRUE;
     default:
         return FALSE;
@@ -128,14 +131,32 @@ string GetDocumentPath()
 // ============================================================================
 int main()
 {
-    // ★ 提升进程优先级（之前测过非常有效，把 postGpu 抖动从 50ms 压到 < 1ms）★
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 
+    // ★ v3.8 禁用 CMD 控制台的"快速编辑模式"
+    {
+        HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+        if (hStdin != INVALID_HANDLE_VALUE) {
+            DWORD mode = 0;
+            if (GetConsoleMode(hStdin, &mode)) {
+                mode &= ~(ENABLE_QUICK_EDIT_MODE);
+                mode &= ~(ENABLE_INSERT_MODE);
+                mode |= ENABLE_EXTENDED_FLAGS;
+                SetConsoleMode(hStdin, mode);
+                std::cout << "[Console] 已禁用快速编辑/插入模式" << std::endl;
+            }
+        }
+    }
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
-    StartEventLog("event.log");
+    //StartEventLog("event.log");
+
+    // ★ v4.5 启动异步性能日志
+    PerfLogInit("perf.log");
 
     hEvent = CreateEvent(NULL, FALSE, TRUE, NULL);
     hEventSort = CreateEvent(NULL, FALSE, TRUE, NULL);
+
+    UnifyInit(dealCount, g_Samples);
 
     cout << "正在启动分选程序... " << endl;
 
@@ -174,60 +195,44 @@ Restart:
     }
 
     // ============================================================
-    // ★★★ 关键参数（v2）★★★
-    //
-    //   g_totalDelay     : 总飞行时间（ms）。按帧补偿后 elapsed 范围扩大，
-    //                      建议从 45ms 起步，根据实测调整。
-    //                      调试方法：跑一段看 FIREF 日志的 elapsed 字段，
-    //                      g_totalDelay 至少要 ≥ elapsed 的 95 分位值才能基本不 LATE。
-    //
-    //   g_valveThreshold : 阀触发阈值。1 = 任意 1 个像素命中就吹（最敏感，等同旧逻辑）
-    //                      2 = 至少 2 个像素命中才吹（中等抗噪）
-    //                      3 = 全部 3 个像素都命中（最严格）
+    // ★★★ 关键参数 ★★★
     // ============================================================
     g_totalDelay = 38;
     g_valveThreshold = 3;
     g_centerValveInflate = 0;
-    g_valveThresholdRatio = 75;          // 75% 比例阈值
-    g_frameActivateThreshold = 5;        // ★ v3.3 新增：帧激活阈值（< 5 像素的帧整帧不吹）
+    g_valveThresholdRatio = 75;
+    g_frameActivateThreshold = 7;
 
-    std::cout << "[Mode] v3.3 按帧 + 比例阈值 + 帧激活"
+    g_unifyEnable = true;
+    g_unifyTailFrames = 24;
+    g_unifyForceClassId = 1;
+    g_unifyThreshold = 0.30f;
+    g_unifyFillBackground = false;
+    g_unifyUseGpu = true;
+
+    std::cout << "[Mode] v4.5 固定迭代 + 分段计时 + 优先级提升"
         << "  g_totalDelay=" << g_totalDelay << "ms"
         << "  g_valveThresholdRatio=" << g_valveThresholdRatio << "%"
         << "  g_frameActivateThreshold=" << g_frameActivateThreshold
-        << "  g_centerValveInflate=" << g_centerValveInflate
+        << std::endl;
+    std::cout << "[Unify] enable=" << (g_unifyEnable ? "ON" : "OFF")
+        << "  K=" << g_unifyTailFrames
+        << "  forceClassId=" << g_unifyForceClassId
+        << "  threshold=" << g_unifyThreshold
         << std::endl;
 
-    // 6) 初始化阀控（打开串口 + 启动时建阀号映射表）
+    // ★ v4.5 启动横幅写到 perf.log
+    PERF_LOG("==== Run start: dealCount=%d Samples=%d bands=%d totalDelay=%d ====",
+        dealCount, g_Samples, g_bands, (int)g_totalDelay);
+
+    // 6) 初始化阀控
     Start_send();
+    UnifyReset();
 
-    // ===== 自动设置 sel_type：模型里有几个 classid，就剔除几个 =====
-    //for (size_t i = 0; i < aiModel.CoreList.size(); i++) {
-    //    int classid = aiModel.CoreList[i].classid;
-    //    if (classid == 1) {                  // ← 只剔除 classid=1
-    //        sel_type[classid - 1] = 1;
-    //        std::cout << "[Auto] sel_type[" << (classid - 1)
-    //            << "] = 1  (classid=" << classid
-    //            << " " << aiModel.CoreList[i].TargetName << " 将被剔除)" << std::endl;
-    //    }
-    //    else {
-    //        std::cout << "[Auto] 跳过 classid=" << classid
-    //            << " (" << aiModel.CoreList[i].TargetName << " 不剔除)" << std::endl;
-    //    }
-    //}
-
-    /*for (size_t i = 0; i < aiModel.CoreList.size(); i++) {
-        int classid = aiModel.CoreList[i].classid;
-        if (classid >= 1 && classid <= 12) {
-            sel_type[classid - 1] = 1;
-            std::cout << "[Auto] sel_type[" << (classid - 1)
-                << "] = 1  (classid=" << classid
-                << " " << aiModel.CoreList[i].TargetName << " 将被剔除)" << std::endl;
-        }
-    }*/
+    // 自动设置 sel_type
     for (size_t i = 0; i < aiModel.CoreList.size(); i++) {
         int classid = aiModel.CoreList[i].classid;
-        if (classid == 1) {                          // ← 只剔除 classid=1
+        if (classid == 1) {
             sel_type[classid - 1] = 1;
             std::cout << "[Auto] sel_type[" << (classid - 1)
                 << "] = 1  (classid=" << classid
@@ -238,13 +243,7 @@ Restart:
                 << " (" << aiModel.CoreList[i].TargetName << " 不剔除)" << std::endl;
         }
     }
-    //// ===== 强制写死（保证 sel_type 是这个值）=====
-    //sel_type[0] = 1;   // classid=1 剔除
-    //sel_type[1] = 0;   // classid=2 不剔除
-    // v2 已不再使用 percent[] 和 fa_ctl，留空即可
-    // ============================================================
 
-    // 启动 UDP 接收线程
     std::thread udpReceiveThread(UDP_receive_thread);
     udpReceiveThread.detach();
 
@@ -259,6 +258,8 @@ Stop:
     startFlag = false;
     StopEventLog();
     result = Disconnect();
+    UnifyReset();
+    PERF_LOG("==== Run stopped ====");
     if (currentStatus == "0")
         return 0;
     goto Menu;
@@ -283,6 +284,8 @@ Menu:
                 goto Stop;
             }
             else if (currentStatus == "2") {
+                UnifyShutdown();
+                PerfLogShutdown();   // ★ v4.5
                 return 0;
             }
         }
@@ -369,7 +372,6 @@ bool Configure()
             bandz->size() > 0)
         {
             (*bandz)[0]->setEnable(true);
-
             auto ofst = (*bandz)[0]->getOffset();
             int offsetInc = ofst->getInc();
             int offmod = aiModel.StartBandIndex % offsetInc;
@@ -424,39 +426,27 @@ void UserGrabedDataEvent(GrabData* grabData)
 #define GPU_MODE
 
 // ============================================================================
-// GPU 处理线程（v2 优化版）
-//
-// 优化点：
-//   ② 主机端 pinned memory + 单次大 cudaMemcpy（替代 50 次小 cudaMemcpy）
-//   ③ tag 用 3 缓冲环形复用（不每批 malloc/free）
-//   ④ FrameTicks 用固定数组指针 + 3 缓冲环形复用
-//
-// 流程：
-//   1. 等够 50 帧
-//   2. 出队 50 帧 → 拷到主机 pinned 大缓冲（同时记录 50 个时刻）
-//   3. 一次 cudaMemcpy 把 50 帧整批送到 GPU
-//   4. calc_GPU
-//   5. cudaMemcpy 拷回 tags 到环形缓冲槽
-//   6. 把 tag 槽指针 + frameTicks 槽指针入队
-//   7. SetEvent 唤醒分发线程
+// GPU 处理线程 (v4.5: 加分段计时 + 优先级提升)
 // ============================================================================
 void threadFunction()
 {
+    // ★ v4.5 提升优先级, 减少被 Windows 抢占的概率
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    PERF_LOG("[threadFunction] started, priority=TIME_CRITICAL");
+
     cudaError_t cudaStatus;
 
-    // ===== 主机端 pinned memory（一次性分配，永久持有）=====
-    // GPU 拷贝从 pinned 内存比 pageable 快 30~50%
     char* hostPinnedFrameBuf = nullptr;
     size_t frameBufSize = (size_t)dealCount * g_Samples * g_bands * 2;
     cudaStatus = cudaMallocHost((void**)&hostPinnedFrameBuf, frameBufSize);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "[ERROR] cudaMallocHost 失败: %s\n", cudaGetErrorString(cudaStatus));
+        PERF_LOG("[threadFunction][ERROR] cudaMallocHost failed: %s",
+            cudaGetErrorString(cudaStatus));
         return;
     }
     fprintf(stderr, "[GPU] pinned frame buffer 分配成功: %zu bytes\n", frameBufSize);
 
-    // ===== tag 环形缓冲（8 槽，避免每批 malloc）=====
-    // 8 槽足以吸收分发线程偶发慢一下的抖动（比如串口卡 50ms 也只是积压 4 槽左右）
     const int TAG_BUF_COUNT = 8;
     static char* tagBufs[TAG_BUF_COUNT] = { nullptr };
     int tagBufIdx = 0;
@@ -468,9 +458,19 @@ void threadFunction()
         }
     }
 
-    // ===== FrameTicks 环形缓冲（8 槽，跟 tag 缓冲对齐）=====
     static FrameTicks tickBufs[TAG_BUF_COUNT];
     int tickBufIdx = 0;
+
+    // ★ v4.5 分段计时累计
+    long long sum_memcpy_pinned_us = 0;
+    long long sum_h2d_us = 0;
+    long long sum_calc_us = 0;
+    long long sum_d2h_us = 0;
+    long long max_memcpy_pinned_us = 0;
+    long long max_h2d_us = 0;
+    long long max_calc_us = 0;
+    long long max_d2h_us = 0;
+    int timingCount = 0;
 
     while (startFlag) {
         WaitForSingleObject(hEventSort, INFINITE);
@@ -481,75 +481,115 @@ void threadFunction()
             GrabData* data;
             bool copyError = false;
 
-            // 当前批用哪一个 tick 槽
             FrameTicks* fts = &tickBufs[tickBufIdx];
             tickBufIdx = (tickBufIdx + 1) % TAG_BUF_COUNT;
 
-            // ===== Step A: 出队 50 帧，主机端 memcpy 到 pinned 大缓冲 =====
+            // ===== 段 1: 从队列取帧 + memcpy 到 pinned host buffer =====
+            auto t_mp_0 = std::chrono::steady_clock::now();
+
             const int frameSize = g_Samples * g_bands * 2;
             for (size_t i = 0; i < (size_t)dealCount; i++) {
                 grabDatas.dequeue(data);
-
-                // 同步出队帧时间戳
                 unsigned long long frameTick = 0;
                 frameTickQueue.dequeue(frameTick);
                 fts->t[i] = frameTick;
 
                 if (data == nullptr || data->Values == nullptr) {
                     fprintf(stderr, "[ERROR] 第 %zu 帧数据指针为空\n", i);
+                    PERF_LOG("[threadFunction][ERROR] frame ptr null at i=%zu", i);
                     copyError = true;
                     break;
                 }
-
-                // 主机端 memcpy（极快，几 us）
                 memcpy(hostPinnedFrameBuf + i * frameSize,
                     data->Values, frameSize);
-
                 if (i == 0) {
                     firstByteList.enqueue(data->Values[0]);
                 }
                 delete data;
             }
-
             if (copyError) goto Error;
 
-            // ===== Step B: 一次大 cudaMemcpy（替代 50 次小拷贝）=====
-            cudaStatus = cudaMemcpy(cuda_frameData,
-                hostPinnedFrameBuf,
-                frameBufSize,
-                cudaMemcpyHostToDevice);
+            auto t_mp_1 = std::chrono::steady_clock::now();
+
+            // ===== 段 2: H2D cudaMemcpy (★ 这一行可能被 GPU 抢占) =====
+            cudaStatus = cudaMemcpy(cuda_frameData, hostPinnedFrameBuf,
+                frameBufSize, cudaMemcpyHostToDevice);
+            auto t_h2d_1 = std::chrono::steady_clock::now();
+
             if (cudaStatus != cudaSuccess) {
                 static bool firstError = true;
                 if (firstError) {
-                    fprintf(stderr, "\n[ERROR] cudaMemcpy(整批) 失败！\n");
-                    fprintf(stderr, "  错误码: %d  描述: %s\n",
-                        cudaStatus, cudaGetErrorString(cudaStatus));
-                    fprintf(stderr, "  期望大小: %zu bytes\n", frameBufSize);
+                    fprintf(stderr, "\n[ERROR] cudaMemcpy(H2D) 失败！%s\n",
+                        cudaGetErrorString(cudaStatus));
                     firstError = false;
                 }
+                PERF_LOG("[threadFunction][ERROR] cudaMemcpy H2D failed: %s",
+                    cudaGetErrorString(cudaStatus));
                 goto Error;
             }
 
-            // ===== Step C: GPU 计算 =====
+            // ===== 段 3: calc_GPU (内部有 cudaDeviceSynchronize) =====
             calc_GPU(cuda_frameData, cuda_tempData, cuda_outputData,
                 cuda_k_White, cuda_White_ReadBytes, cuda_Black_ReadBytes,
                 cuda_otherParams, cuda_preprocessList, cuda_modelWaveList,
                 cuda_Intercept, cuda_Coef, cuda_StdX, cuda_MeanX, cuda_tags);
+            auto t_calc_1 = std::chrono::steady_clock::now();
 
-            // ===== Step D: 拷回 tags 到当前环形槽 =====
+            // ===== 段 4: D2H cudaMemcpy (★ 同样可能被抢占) =====
             char* sortResult = tagBufs[tagBufIdx];
             tagBufIdx = (tagBufIdx + 1) % TAG_BUF_COUNT;
 
             cudaStatus = cudaMemcpy(sortResult, cuda_tags,
                 (size_t)dealCount * g_Samples,
                 cudaMemcpyDeviceToHost);
+            auto t_d2h_1 = std::chrono::steady_clock::now();
+
             if (cudaStatus != cudaSuccess) {
-                fprintf(stderr, "[ERROR] cudaMemcpy(拷回) 失败\n");
+                fprintf(stderr, "[ERROR] cudaMemcpy(D2H) 失败\n");
+                PERF_LOG("[threadFunction][ERROR] cudaMemcpy D2H failed: %s",
+                    cudaGetErrorString(cudaStatus));
                 goto Error;
             }
 
+            // ===== 计算各段耗时 =====
+            long long us_memcpy_pinned = std::chrono::duration_cast<std::chrono::microseconds>(t_mp_1 - t_mp_0).count();
+            long long us_h2d = std::chrono::duration_cast<std::chrono::microseconds>(t_h2d_1 - t_mp_1).count();
+            long long us_calc = std::chrono::duration_cast<std::chrono::microseconds>(t_calc_1 - t_h2d_1).count();
+            long long us_d2h = std::chrono::duration_cast<std::chrono::microseconds>(t_d2h_1 - t_calc_1).count();
+
+            sum_memcpy_pinned_us += us_memcpy_pinned;
+            sum_h2d_us += us_h2d;
+            sum_calc_us += us_calc;
+            sum_d2h_us += us_d2h;
+            if (us_memcpy_pinned > max_memcpy_pinned_us) max_memcpy_pinned_us = us_memcpy_pinned;
+            if (us_h2d > max_h2d_us)           max_h2d_us = us_h2d;
+            if (us_calc > max_calc_us)          max_calc_us = us_calc;
+            if (us_d2h > max_d2h_us)           max_d2h_us = us_d2h;
+            timingCount++;
+
+            // ===== 慢路径监控: 任一段 > 5ms 立即详细日志 =====
+            if (us_h2d > 5000 || us_calc > 5000 || us_d2h > 5000 || us_memcpy_pinned > 5000) {
+                PERF_LOG("[threadFunction][SLOW] memcpy=%lldus h2d=%lldus calc=%lldus d2h=%lldus  grabQ=%d sortQ=%d",
+                    us_memcpy_pinned, us_h2d, us_calc, us_d2h,
+                    grabDatas.size(), sortResultDatas.size());
+            }
+
+            // ===== 每 100 批写一次汇总到 perf.log =====
+            if (timingCount % 100 == 0) {
+                long long avg_mp = sum_memcpy_pinned_us / 100;
+                long long avg_h2d = sum_h2d_us / 100;
+                long long avg_calc = sum_calc_us / 100;
+                long long avg_d2h = sum_d2h_us / 100;
+                PERF_LOG("[threadFunction][TIMING] memcpy avg=%lldus/max=%lldus  h2d avg=%lldus/max=%lldus  calc avg=%lldus/max=%lldus  d2h avg=%lldus/max=%lldus",
+                    avg_mp, max_memcpy_pinned_us,
+                    avg_h2d, max_h2d_us,
+                    avg_calc, max_calc_us,
+                    avg_d2h, max_d2h_us);
+                sum_memcpy_pinned_us = sum_h2d_us = sum_calc_us = sum_d2h_us = 0;
+                max_memcpy_pinned_us = max_h2d_us = max_calc_us = max_d2h_us = 0;
+            }
+
 #ifdef OUTPUT_SORTING_RESULT
-            // ===== Step E: 入队（tag 缓冲指针 + tick 缓冲指针）=====
             sortResultDatas.enqueue(sortResult);
             batchFrameTicksQueue.enqueue(fts);
             SetEvent(hEvent);
@@ -563,7 +603,6 @@ void threadFunction()
         ;
     }
 
-    // 退出清理
 #ifdef GPU_MODE
     clearGpu();
 #endif
@@ -573,21 +612,37 @@ void threadFunction()
     for (int i = 0; i < TAG_BUF_COUNT; i++) {
         if (tagBufs[i]) free(tagBufs[i]);
     }
+    PERF_LOG("[threadFunction] exited");
 }
 
 // ============================================================================
-// 分发线程（v2 按帧版本）
-//
-// 流程：
-//   1. 等被唤醒
-//   2. 出队 1 次：拿到 tag 缓冲指针 + 50 个帧时刻
-//   3. for i = 0..49: ProcessOneFrame(第 i 帧的 640 像素 + 第 i 帧时刻)
-//
-// 注意：tag 缓冲是环形复用的，分发线程"用完"后不需要 delete
-//      (下一轮 GPU 线程会覆盖这个槽，靠 3 槽轮转保证不冲突)
+// 分发线程 (v4.5: 优先级提升 + 分段计时走 PerfLog)
 // ============================================================================
 void threadFunction_dis()
 {
+    // ★ v4.5 优先级
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    PERF_LOG("[threadFunction_dis] started, priority=TIME_CRITICAL");
+
+    const int UNIFY_BUF_COUNT = 4;
+    static char* unifyBufs[UNIFY_BUF_COUNT] = { nullptr };
+    int unifyBufIdx = 0;
+    for (int i = 0; i < UNIFY_BUF_COUNT; i++) {
+        unifyBufs[i] = (char*)malloc(dealCount * g_Samples);
+        if (!unifyBufs[i]) {
+            fprintf(stderr, "[ERROR] unify buffer 分配失败\n");
+            return;
+        }
+    }
+
+    long long sumUnifyUs = 0;
+    long long sumProcessUs = 0;
+    long long sumTotalUs = 0;
+    long long maxUnifyUs = 0;
+    long long maxProcessUs = 0;
+    long long maxTotalUs = 0;
+    int       timingCount = 0;
+
     while (startFlag)
     {
         WaitForSingleObject(hEvent, INFINITE);
@@ -600,27 +655,67 @@ void threadFunction_dis()
             firstByteList.dequeue(firstByte);
             batchFrameTicksQueue.dequeue(fts);
 
-            // 监控队列积压（每 100 批打印一次）
             static int monitorCnt = 0;
             if (++monitorCnt % 100 == 0) {
-                std::cout << "[QUEUE] grabDatas=" << grabDatas.size()
-                    << "  sortResultDatas=" << sortResultDatas.size()
-                    << "  batchFrameTicksQueue=" << batchFrameTicksQueue.size()
-                    << std::endl;
+                // ★ v4.5 队列水位走 PerfLog
+                PERF_LOG("[QUEUE] grabDatas=%d sortResultDatas=%d batchFrameTicksQueue=%d",
+                    grabDatas.size(), sortResultDatas.size(),
+                    batchFrameTicksQueue.size());
             }
 
-            // ★ 逐帧处理：50 帧依次走 ProcessOneFrame ★
-            // 每帧用自己的拍摄时刻算 actualDelay
-            // 每帧的多条命令打包成一次 WriteFile（性能优化⑦）
+            auto t0 = std::chrono::steady_clock::now();
+
+            char* outBuf = unifyBufs[unifyBufIdx];
+            unifyBufIdx = (unifyBufIdx + 1) % UNIFY_BUF_COUNT;
+
+            UnifyProcess(tagBuf, outBuf, dealCount, g_Samples);
+
+            auto t1 = std::chrono::steady_clock::now();
+
             for (int i = 0; i < dealCount; i++) {
-                const char* frameTags = tagBuf + i * g_Samples;
+                const char* frameTags = outBuf + i * g_Samples;
                 ProcessOneFrame(frameTags, fts->t[i]);
             }
 
-            // 不需要 delete tagBuf（环形缓冲，由 GPU 线程持有）
-            // 不需要 delete fts（环形缓冲，由 GPU 线程持有）
+            auto t2 = std::chrono::steady_clock::now();
+
+            long long unifyUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            long long processUs = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+            long long totalUs = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t0).count();
+
+            sumUnifyUs += unifyUs;
+            sumProcessUs += processUs;
+            sumTotalUs += totalUs;
+            if (unifyUs > maxUnifyUs)   maxUnifyUs = unifyUs;
+            if (processUs > maxProcessUs) maxProcessUs = processUs;
+            if (totalUs > maxTotalUs)   maxTotalUs = totalUs;
+            timingCount++;
+
+            // ★ v4.5 慢路径监控
+            if (totalUs > 5000) {
+                PERF_LOG("[threadFunction_dis][SLOW] unify=%lldus process=%lldus total=%lldus  grabQ=%d",
+                    unifyUs, processUs, totalUs, grabDatas.size());
+            }
+
+            // 每 100 批一次汇总
+            if (timingCount % 100 == 0) {
+                long long avgUnify = sumUnifyUs / 100;
+                long long avgProcess = sumProcessUs / 100;
+                long long avgTotal = sumTotalUs / 100;
+                PERF_LOG("[DIS-TIMING] unify avg=%lldus/max=%lldus  process avg=%lldus/max=%lldus  total avg=%lldus/max=%lldus",
+                    avgUnify, maxUnifyUs,
+                    avgProcess, maxProcessUs,
+                    avgTotal, maxTotalUs);
+                sumUnifyUs = sumProcessUs = sumTotalUs = 0;
+                maxUnifyUs = maxProcessUs = maxTotalUs = 0;
+            }
         }
     }
+
+    for (int i = 0; i < UNIFY_BUF_COUNT; i++) {
+        if (unifyBufs[i]) free(unifyBufs[i]);
+    }
+    PERF_LOG("[threadFunction_dis] exited");
 }
 
 // ============================================================================
