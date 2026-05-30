@@ -12,6 +12,11 @@
 //   - ProcessOneFrame 推命令到队列后立即返回 (~5us)
 //   - 后台线程异步执行 WriteFile, 不阻塞主流程
 //   - process max 从 ~44ms 降到 < 1ms
+//
+// v4.6 改动（参数日志）：
+//   - 新增 LogAllParams(): 把当前全部运行参数快照写入 perf.log
+//   - ApplyParam 拆为 ApplyParamImpl + 带日志外壳: 每次 UDP 改参自动留痕
+//     [PARAM-CHG] 行带时间戳, 便于把"误吹出现时间"对上"哪次改了哪个参数"
 // ============================================================================
 #include "Eject.h"
 #include "EventLog.h"
@@ -32,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include "PerfLog.h"              // ★ v4.6 参数日志
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -131,6 +137,30 @@ void SetEjectParams(unsigned short durationMs, unsigned short delayMs) {
 void SetPixelOffset(int frontOffset, int backOffset) {
     g_frontOffset = frontOffset;
     g_backOffset = backOffset;
+}
+
+// ============================================================================
+// ★ v4.6 参数快照：把当前全部运行参数写入 perf.log
+//   放在这里（Eject.cpp）的原因：g_duration 是本文件的 static 变量,
+//   只有同一翻译单元能读到。
+//   注意：PerfLog 单条上限 220 字节, 下面每行都远小于此, 不会被截断。
+// ============================================================================
+void LogAllParams(const char* tag)
+{
+    PERF_LOG("==== PARAMS (%s) ====", tag ? tag : "");
+    PERF_LOG("[PARAM] totalDelay=%dms duration=%dms valveRatio=%d%% valveThreshold=%d frameActivate=%d centerInflate=%d",
+        (int)g_totalDelay, (int)g_duration, g_valveThresholdRatio,
+        g_valveThreshold, g_frameActivateThreshold, g_centerValveInflate);
+    PERF_LOG("[PARAM] unify enable=%d useGpu=%d tailFrames=%d forceClassId=%d threshold=%.3f fillBg=%d",
+        (int)g_unifyEnable, (int)g_unifyUseGpu, g_unifyTailFrames,
+        g_unifyForceClassId, g_unifyThreshold, (int)g_unifyFillBackground);
+
+    // 哪些 class 会被吹（sel_type=1）
+    std::string ej;
+    for (int i = 0; i < 12; i++)
+        if (sel_type[i]) ej += std::to_string(i + 1) + " ";
+    PERF_LOG("[PARAM] eject classes (sel_type=1): %s",
+        ej.empty() ? "(none)" : ej.c_str());
 }
 
 void BuildValveMap()
@@ -657,9 +687,13 @@ static void BuildParam(unsigned char* p, unsigned char id,
     }
 }
 
-// 应用一个参数到全局变量
+// ============================================================================
+// 应用一个参数到全局变量（内部实现）
 //   返回：0=OK, 2=越界, 3=类型错误, 1=未知
-static int ApplyParam(unsigned char paramId, unsigned char dataType,
+//   ★ v4.6: 原 ApplyParam 改名为 ApplyParamImpl, switch 逻辑保持不变;
+//            外层加一个带日志的 ApplyParam 外壳（见下方）。
+// ============================================================================
+static int ApplyParamImpl(unsigned char paramId, unsigned char dataType,
     int intVal, float floatVal)
 {
     switch (paramId) {
@@ -739,6 +773,46 @@ static int ApplyParam(unsigned char paramId, unsigned char dataType,
             << std::dec << std::endl;
         return ACK_UNKNOWN_PARAM;
     }
+}
+
+// ============================================================================
+// ★ v4.6 参数 ID → 可读名字（仅供日志使用）
+// ============================================================================
+static const char* ParamName(unsigned char id) {
+    switch (id) {
+    case PID_TOTAL_DELAY:         return "totalDelay";
+    case PID_DURATION:            return "duration";
+    case PID_VALVE_RATIO:         return "valveRatio%";
+    case PID_FRAME_ACTIVATE:      return "frameActivate";
+    case PID_CENTER_INFLATE:      return "centerInflate";
+    case PID_UNIFY_ENABLE:        return "unifyEnable";
+    case PID_UNIFY_TAIL_FRAMES:   return "unifyTailFrames";
+    case PID_UNIFY_FORCE_CLASSID: return "unifyForceClassId";
+    case PID_UNIFY_THRESHOLD:     return "unifyThreshold";
+    case PID_UNIFY_FILL_BG:       return "unifyFillBg";
+    default:                      return "unknown";
+    }
+}
+
+// ============================================================================
+// ★ v4.6 ApplyParam 外壳：应用参数 + 写日志
+//   每次 UDP 改参成功/失败都在 perf.log 留一行 [PARAM-CHG]（带时间戳）。
+//   调用方（HandleParamPacket）无需改动。
+// ============================================================================
+static int ApplyParam(unsigned char paramId, unsigned char dataType,
+    int intVal, float floatVal)
+{
+    int r = ApplyParamImpl(paramId, dataType, intVal, floatVal);
+    if (r == ACK_OK) {
+        if (dataType == TYPE_FLOAT)
+            PERF_LOG("[PARAM-CHG] %s = %.3f  (UDP OK)", ParamName(paramId), floatVal);
+        else
+            PERF_LOG("[PARAM-CHG] %s = %d  (UDP OK)", ParamName(paramId), intVal);
+    }
+    else {
+        PERF_LOG("[PARAM-CHG] %s set FAILED code=%d", ParamName(paramId), r);
+    }
+    return r;
 }
 
 // 发送 SET 响应

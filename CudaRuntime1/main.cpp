@@ -1,6 +1,6 @@
 ﻿// ============================================================================
 // 文件名：main.cpp
-// 版本  ：v4.5
+// 版本  ：v4.6
 // 作用  ：工业分选程序的主入口
 //
 // v4.5 改动 (相对 v3.6):
@@ -11,6 +11,10 @@
 //   3. 引入 PerfLog 异步日志模块, 输出到 perf.log
 //      → 热路径上日志开销 < 1us, 缓冲满直接丢弃, 不阻塞
 //   4. dis 线程每 100 批打印一次队列水位 (改为走 PerfLog)
+//
+// v4.6 改动:
+//   5. ★ 启动时调 LogAllParams("run start") 把全部运行参数快照写入 perf.log
+//      配合 Eject.cpp 的 [PARAM-CHG] 改参留痕, 排查"误吹/参数变化"更直接
 // ============================================================================
 
 #include <stdio.h>
@@ -148,7 +152,7 @@ int main()
         }
     }
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
-    //StartEventLog("event.log");
+    StartEventLog("event.log");
 
     // ★ v4.5 启动异步性能日志
     PerfLogInit("perf.log");
@@ -243,6 +247,9 @@ Restart:
                 << " (" << aiModel.CoreList[i].TargetName << " 不剔除)" << std::endl;
         }
     }
+
+    // ★ v4.6 sel_type 已确定, 打一份完整参数快照到 perf.log
+    LogAllParams("run start");
 
     std::thread udpReceiveThread(UDP_receive_thread);
     udpReceiveThread.detach();
