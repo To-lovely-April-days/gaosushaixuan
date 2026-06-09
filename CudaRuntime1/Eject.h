@@ -19,6 +19,23 @@
 extern const int VALVE_COUNT;   // 阀总数（192）
 
 // ============================================================================
+// ★ 阀控通信方式开关
+//   VALVE_COMM_SERIAL = 0  旧方式：串口 (COM 口) WriteFile, 每段 7 字节帧
+//   VALVE_COMM_UDP    = 1  新方式：千兆网 UDP 发往接口板 (默认)
+//                          目标 192.168.1.1:10100, 每段 20 字节帧
+//                          (14 字节固定包头 + 阀起2 + 阀止2 + 延时1 + 时长1)
+//   默认 = VALVE_COMM_UDP。需要切回串口时在 Start_send 之前调
+//   SetValveCommMode(VALVE_COMM_SERIAL)。
+// ============================================================================
+enum ValveCommMode { VALVE_COMM_SERIAL = 0, VALVE_COMM_UDP = 1 };
+extern std::atomic<int> g_valveCommMode;   // 默认 VALVE_COMM_UDP
+
+// 切换阀控通信方式（应在 Start_send 之前调用）
+void SetValveCommMode(int mode);
+// 配置 UDP 阀控目标接口板地址（默认 192.168.1.1:10100）
+void SetValveUdpTarget(const std::string& ip, unsigned short port);
+
+// ============================================================================
 // 心跳字节（保留，UDP 接收线程仍用）
 // ============================================================================
 extern char firstByte;

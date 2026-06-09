@@ -65,6 +65,33 @@ const int VALVE_COUNT = 192;
 ValveRange g_valveMap[VALVE_COUNT];
 bool       g_valveMapReady = false;
 
+// ============================================================================
+// ★ 阀控通信方式（默认 UDP）
+// ============================================================================
+std::atomic<int> g_valveCommMode{ VALVE_COMM_UDP };
+
+// ===== UDP 阀控目标（千兆网接口板）=====
+static std::string    g_valveUdpIp = "192.168.1.1";
+static unsigned short g_valveUdpPort = 10100;
+static SOCKET         g_valveUdpSocket = INVALID_SOCKET;
+static sockaddr_in    g_valveUdpAddr{};
+static std::atomic<bool> g_valveUdpReady{ false };
+
+// 新 UDP 协议固定包头（14 字节），其后接 6 字节负载
+static const unsigned char UDP_VALVE_HEADER[14] = {
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0xFF
+};
+#define UDP_VALVE_PACKET_LEN  20   // 14 头 + 6 负载
+
+void SetValveCommMode(int mode) {
+    g_valveCommMode.store(mode);
+}
+void SetValveUdpTarget(const std::string& ip, unsigned short port) {
+    g_valveUdpIp = ip;
+    g_valveUdpPort = port;
+}
+
 // ===== 串口配置 =====
 static std::string  g_comPort = "COM8";
 static int          g_baudRate = 961200;
@@ -93,8 +120,10 @@ static HANDLE g_hSerial = INVALID_HANDLE_VALUE;
 // ★ v3.8 异步串口发送
 // ============================================================================
 struct SerialCmd {
-    unsigned char buf[1024];   // 单批最多 192 阀 × 7 字节, 1024 足够
-    int len;
+    // 单帧最多 96 段(交替开/关)。串口 96×7=672, UDP 96×20=1920, 4096 足够
+    unsigned char buf[4096];
+    int  len;
+    bool isUdp;   // ★ true=UDP sendto(20字节/段), false=串口 WriteFile(7字节/段)
 };
 
 static std::queue<SerialCmd*>    g_serialQueue;
@@ -220,7 +249,64 @@ void BuildValveMap()
 static void StartSerialThread();
 static void StopSerialThread();
 
-bool Start_send()
+// ============================================================================
+// ★ 当前阀控通信链路是否就绪（按通信方式判断）
+// ============================================================================
+static bool ValveTransportReady()
+{
+    if (g_valveCommMode.load() == VALVE_COMM_UDP)
+        return g_valveUdpReady.load();
+    return g_hSerial != INVALID_HANDLE_VALUE;
+}
+
+// ============================================================================
+// ★ UDP 阀控链路 开/关
+//   WSAStartup/WSACleanup 带引用计数, 与 UDP_receive_thread 并存无碍
+// ============================================================================
+static bool StartValveUdp()
+{
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "[Eject] WSAStartup 失败(UDP阀控)" << std::endl;
+        return false;
+    }
+
+    g_valveUdpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (g_valveUdpSocket == INVALID_SOCKET) {
+        std::cerr << "[Eject] UDP 阀控套接字创建失败" << std::endl;
+        WSACleanup();
+        return false;
+    }
+
+    g_valveUdpAddr.sin_family = AF_INET;
+    g_valveUdpAddr.sin_port = htons(g_valveUdpPort);
+    if (inet_pton(AF_INET, g_valveUdpIp.c_str(), &g_valveUdpAddr.sin_addr) != 1) {
+        std::cerr << "[Eject] UDP 阀控目标 IP 非法: " << g_valveUdpIp << std::endl;
+        closesocket(g_valveUdpSocket);
+        g_valveUdpSocket = INVALID_SOCKET;
+        WSACleanup();
+        return false;
+    }
+
+    g_valveUdpReady.store(true);
+    return true;
+}
+
+static void StopValveUdp()
+{
+    if (!g_valveUdpReady.load() && g_valveUdpSocket == INVALID_SOCKET) return;
+    g_valveUdpReady.store(false);
+    if (g_valveUdpSocket != INVALID_SOCKET) {
+        closesocket(g_valveUdpSocket);
+        g_valveUdpSocket = INVALID_SOCKET;
+    }
+    WSACleanup();
+}
+
+// ============================================================================
+// ★ 打开串口（从 Start_send 抽出, 仅串口模式调用）
+// ============================================================================
+static bool OpenSerialPort()
 {
     g_hSerial = CreateFileA(
         g_comPort.c_str(),
@@ -269,6 +355,24 @@ bool Start_send()
 
     std::cout << "[Eject] 串口打开成功: " << g_comPort
         << " @ " << g_baudRate << " bps" << std::endl;
+    return true;
+}
+
+bool Start_send()
+{
+    bool useUdp = (g_valveCommMode.load() == VALVE_COMM_UDP);
+
+    if (useUdp) {
+        if (!StartValveUdp()) return false;
+        std::cout << "[Eject] 阀控通信方式: UDP -> "
+            << g_valveUdpIp << ":" << g_valveUdpPort
+            << " (新协议, 20字节/段)" << std::endl;
+    }
+    else {
+        if (!OpenSerialPort()) return false;
+        std::cout << "[Eject] 阀控通信方式: 串口 (旧协议, 7字节/段)" << std::endl;
+    }
+
     std::cout << "[Eject] 像素偏移: 前=" << g_frontOffset
         << " 后=" << g_backOffset
         << " 有效范围=[" << g_frontOffset << "," << (g_Samples - g_backOffset) << "]"
@@ -298,6 +402,12 @@ void Stop_send()
         g_hSerial = INVALID_HANDLE_VALUE;
         std::cout << "[Eject] 串口已关闭" << std::endl;
     }
+
+    // ★ 关闭 UDP 阀控链路
+    if (g_valveUdpSocket != INVALID_SOCKET) {
+        StopValveUdp();
+        std::cout << "[Eject] UDP 阀控链路已关闭" << std::endl;
+    }
 }
 
 // ============================================================================
@@ -323,12 +433,33 @@ static void SerialSendThread()
             }
         }
 
-        if (cmd && cmd->len > 0 && g_hSerial != INVALID_HANDLE_VALUE) {
-            DWORD bytesWritten = 0;
-            BOOL ok = WriteFile(g_hSerial, cmd->buf, cmd->len, &bytesWritten, NULL);
-            if (!ok) {
-                std::cerr << "[Eject] 异步串口写入失败, 错误码: "
-                    << GetLastError() << std::endl;
+        if (cmd && cmd->len > 0) {
+            if (cmd->isUdp) {
+                // ★ UDP: 每 20 字节作为一个独立数据报发往接口板
+                if (g_valveUdpReady.load() && g_valveUdpSocket != INVALID_SOCKET) {
+                    for (int off = 0;
+                        off + UDP_VALVE_PACKET_LEN <= cmd->len;
+                        off += UDP_VALVE_PACKET_LEN) {
+                        int s = sendto(g_valveUdpSocket,
+                            (const char*)(cmd->buf + off),
+                            UDP_VALVE_PACKET_LEN, 0,
+                            (const sockaddr*)&g_valveUdpAddr,
+                            sizeof(g_valveUdpAddr));
+                        if (s == SOCKET_ERROR) {
+                            std::cerr << "[Eject] UDP 阀控发送失败, 错误码: "
+                                << WSAGetLastError() << std::endl;
+                            break;
+                        }
+                    }
+                }
+            }
+            else if (g_hSerial != INVALID_HANDLE_VALUE) {
+                DWORD bytesWritten = 0;
+                BOOL ok = WriteFile(g_hSerial, cmd->buf, cmd->len, &bytesWritten, NULL);
+                if (!ok) {
+                    std::cerr << "[Eject] 异步串口写入失败, 错误码: "
+                        << GetLastError() << std::endl;
+                }
             }
         }
 
@@ -363,14 +494,15 @@ static void StopSerialThread()
 }
 
 // 入队 (从 ProcessOneFrame 调用, 必须快)
-static void EnqueueSerialCmd(const unsigned char* buf, int len)
+static void EnqueueSerialCmd(const unsigned char* buf, int len, bool isUdp)
 {
-    if (len <= 0 || len > 1024) return;
-    if (g_hSerial == INVALID_HANDLE_VALUE) return;
+    if (len <= 0 || len > (int)sizeof(SerialCmd::buf)) return;
+    if (!ValveTransportReady()) return;
 
     SerialCmd* cmd = new SerialCmd;
     memcpy(cmd->buf, buf, len);
     cmd->len = len;
+    cmd->isUdp = isUdp;
 
     int qsize = 0;
     {
@@ -395,8 +527,10 @@ static void EnqueueSerialCmd(const unsigned char* buf, int len)
 // ============================================================================
 void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
 {
-    if (g_hSerial == INVALID_HANDLE_VALUE) return;
+    if (!ValveTransportReady()) return;
     if (!g_valveMapReady) return;
+
+    bool useUdp = (g_valveCommMode.load() == VALVE_COMM_UDP);
 
     g_currentFrameTick.store(frameTickMs);
 
@@ -508,7 +642,8 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
         }
     }
 
-    unsigned char txBuf[VALVE_COUNT * 7];
+    // UDP 模式每段 20 字节, 串口模式每段 7 字节, 按更大者开缓冲
+    unsigned char txBuf[VALVE_COUNT * UDP_VALVE_PACKET_LEN];
     int txLen = 0;
     int cmdCount = 0;
 
@@ -519,6 +654,16 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
     if (actualDelay < 0) { actualDelay = 0; wasNegative = true; }
     if (actualDelay > 65535) actualDelay = 65535;
     unsigned short delay = (unsigned short)actualDelay;
+
+    // ★ 新 UDP 协议: 延时/时长各 1 字节, 范围 1~200ms, 需另行夹取
+    long long udpDelayLL = actualDelay;
+    if (udpDelayLL < 1)   udpDelayLL = 1;     // 不使用延迟时固定 0x01
+    if (udpDelayLL > 200) udpDelayLL = 200;
+    unsigned char udpDelay = (unsigned char)udpDelayLL;
+    int udpDurInt = (int)g_duration;
+    if (udpDurInt < 1)   udpDurInt = 1;
+    if (udpDurInt > 200) udpDurInt = 200;
+    unsigned char udpDuration = (unsigned char)udpDurInt;
 
     int currentBatch = g_batchNo.load();
 
@@ -547,14 +692,29 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
         LogValveDetected(currentBatch, valveStart, valveEnd, hitPixels);
 
         unsigned char* p = txBuf + txLen;
-        p[0] = 0xFF;
-        p[1] = (unsigned char)valveStart;
-        p[2] = (unsigned char)valveEnd;
-        p[3] = (unsigned char)(delay >> 8);
-        p[4] = (unsigned char)(delay & 0xFF);
-        p[5] = (unsigned char)(g_duration >> 8);
-        p[6] = (unsigned char)(g_duration & 0xFF);
-        txLen += 7;
+        if (useUdp) {
+            // ★ 新 UDP 协议帧: 14 字节固定包头 + 阀起2 + 阀止2 + 延时1 + 时长1
+            //   阀编号 0 起始(直接用 segStart/segEnd), 双字节大端
+            memcpy(p, UDP_VALVE_HEADER, 14);
+            p[14] = (unsigned char)((segStart >> 8) & 0xFF);
+            p[15] = (unsigned char)(segStart & 0xFF);
+            p[16] = (unsigned char)((segEnd >> 8) & 0xFF);
+            p[17] = (unsigned char)(segEnd & 0xFF);
+            p[18] = udpDelay;
+            p[19] = udpDuration;
+            txLen += UDP_VALVE_PACKET_LEN;   // 20
+        }
+        else {
+            // 旧串口协议帧: 阀编号 1 起始(valveStart/valveEnd), 延时/时长各 2 字节
+            p[0] = 0xFF;
+            p[1] = (unsigned char)valveStart;
+            p[2] = (unsigned char)valveEnd;
+            p[3] = (unsigned char)(delay >> 8);
+            p[4] = (unsigned char)(delay & 0xFF);
+            p[5] = (unsigned char)(g_duration >> 8);
+            p[6] = (unsigned char)(g_duration & 0xFF);
+            txLen += 7;
+        }
         cmdCount++;
 
         i = segEnd + 1;
@@ -565,7 +725,7 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
     bool writeOk = true;
     if (txLen > 0) {
         unsigned long long t_before_write = NowMs();
-        EnqueueSerialCmd(txBuf, txLen);
+        EnqueueSerialCmd(txBuf, txLen, useUdp);
         unsigned long long t_after_write = NowMs();
         writeTime = (int)(t_after_write - t_before_write);
         // writeOk 总是 true (异步, 实际发送结果由线程处理)

@@ -33,6 +33,7 @@ extern int   g_unifyTailFrames;      // K (建议=dealCount)
 extern int   g_unifyForceClassId;    // 染色目标 (1~12)
 extern float g_unifyThreshold;       // 占比阈值 (0.0~1.0)
 extern bool  g_unifyFillBackground;  // 填洞 (false=保守)
+extern int   g_unifyMinArea;   // (majority-vote) min connected-component area in px, 0=off
 
 // ============================================================================
 // 主接口（外部只需调这几个，跟 v3.6 兼容）

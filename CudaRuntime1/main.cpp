@@ -230,6 +230,9 @@ Restart:
         dealCount, g_Samples, g_bands, (int)g_totalDelay);
 
     // 6) 初始化阀控
+    // ★ 阀控通信方式开关: 默认 UDP(千兆网接口板 192.168.1.1:10100)
+    //    如需切回串口, 改成 SetValveCommMode(VALVE_COMM_SERIAL);
+    SetValveCommMode(VALVE_COMM_UDP);
     Start_send();
     UnifyReset();
 

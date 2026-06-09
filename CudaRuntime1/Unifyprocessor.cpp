@@ -36,6 +36,7 @@ int   g_unifyTailFrames = 24;
 int   g_unifyForceClassId = 1;
 float g_unifyThreshold = 0.30f;
 bool  g_unifyFillBackground = false;
+int   g_unifyMinArea = 0;             // majority-vote noise filter: min component px (0=off)
 
 // ============================================================================
 // Module-level state
@@ -279,45 +280,34 @@ static void ApplyUnify(const char* inTags, char* outTags,
         int fgInComp = g_fgPixels[k];
         if (fgInComp <= 0) continue;
 
-        int targetCount = (forceClassId < MAX_CLASS_ID) ? g_hist[k][forceClassId] : 0;
-        float confidence = (float)targetCount / (float)fgInComp;
-
+        // ----- decision: pure majority vote (+ minArea noise filter) -----
         unsigned char target;
-        if (confidence >= threshold) {
-            // high confidence -> color whole component as target
-            target = forceClassId;
+        if (g_unifyMinArea > 0 && fgInComp < g_unifyMinArea) {
+            // component too small (noise) -> wipe to background, never ejected
+            target = 0;
         }
         else {
-            // low confidence -> majority vote
             int bestCls = 0;
             int bestCnt = 0;
             for (int c = 1; c < MAX_CLASS_ID; c++) {
                 if (g_hist[k][c] > bestCnt) {
                     bestCnt = g_hist[k][c];
-                    bestCls = c;
+                    bestCls = c;   // tie keeps the smaller cls (deterministic)
                 }
             }
-            if (bestCnt == 0) continue;   // abnormal, keep original
+            // bestCls == 0 only when no votable class -> also wipe to background
             target = (unsigned char)bestCls;
         }
 
-        // coloring
+        // ----- coloring: only the real foreground pixels of this component -----
         int r0 = g_bboxR0[k], r1 = g_bboxR1[k];
         int c0 = g_bboxC0[k], c1 = g_bboxC1[k];
 
         for (int i = r0; i <= r1; i++) {
             for (int j = c0; j <= c1; j++) {
                 int idx = i * samples + j;
-                int lab = g_labels[idx];
-                if (lab == k) {
+                if (g_labels[idx] == k) {
                     outTags[idx] = (char)target;
-                }
-                else if (fillBackground && lab == 0) {
-                    // only fill true background (cls=0)
-                    unsigned char orig = (unsigned char)inTags[idx];
-                    if (orig < RESERVED_MIN) {
-                        outTags[idx] = (char)target;
-                    }
                 }
             }
         }
@@ -382,13 +372,6 @@ int UnifyProcess_Cpu(const char* inTags, char* outTags, int numFrames, int numSa
     if (!g_unifyEnable) {
         memcpy(outTags, inTags, numFrames * numSamples);
         UnifyReset();   // clear cache to avoid stale data
-        return 0;
-    }
-
-    // ===== Invalid forceClassId -> pass-through =====
-    if (g_unifyForceClassId < 1 || g_unifyForceClassId >= RESERVED_MIN) {
-        memcpy(outTags, inTags, numFrames * numSamples);
-        UnifyReset();
         return 0;
     }
 
@@ -463,15 +446,7 @@ int UnifyProcess_Cpu(const char* inTags, char* outTags, int numFrames, int numSa
     memcpy(outTags, g_processed + sendOffsetRows * numSamples,
         numFrames * numSamples);
 
-    // ===== Phase E (optional): fillBackground on output =====
-    if (g_unifyFillBackground) {
-        // reuse g_combined as temp buffer
-        memcpy(g_combined, outTags, numFrames * numSamples);
-        ApplyUnify(g_combined, outTags,
-            numFrames, numSamples,
-            force, g_unifyThreshold,
-            true);
-    }
+    // ===== Phase E removed: majority-vote version never fills background =====
 
     // ===== Performance monitoring =====
     auto t1 = std::chrono::high_resolution_clock::now();

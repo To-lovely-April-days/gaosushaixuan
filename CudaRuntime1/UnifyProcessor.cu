@@ -122,6 +122,7 @@ extern int   g_unifyTailFrames;
 extern int   g_unifyForceClassId;
 extern float g_unifyThreshold;
 extern bool  g_unifyFillBackground;
+extern int   g_unifyMinArea;   // majority-vote noise filter (0=off)
 
 // ★ v4.0 新增, 在这里定义 (主程序里 extern 引用即可)
 bool g_unifyUseGpu = true;
@@ -355,17 +356,16 @@ __global__ void k_stats(
 }
 
 // ============================================================================
-// 核函数 5: decide - 算每个连通域的 target (v3.6 决策逻辑)
-//   confidence = hist[forceClassId] / fgInComp
-//   if confidence >= threshold: target = forceClassId
-//   else: target = 多数投票
+// 核函数 5: decide - 算每个连通域的 target (纯多数投票)
+//   target = 票数最多的 cls (平局取较小 cls)
+//   连通域前景像素数 < minArea 时整块清为背景(0), 不吹气
+//   minArea = g_unifyMinArea (UDP 可配, 0=不过滤)
 // ============================================================================
 __global__ void k_decide(
     const int* __restrict__ fgInComp,
     const int* __restrict__ hist,
     unsigned char* __restrict__ target,
-    int forceClassId,
-    float threshold,
+    int minArea,
     int numComps)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -377,28 +377,23 @@ __global__ void k_decide(
         return;
     }
 
-    int forceCount = 0;
-    if (forceClassId >= 1 && forceClassId < MAX_CLASS_ID) {
-        forceCount = hist[k * MAX_CLASS_ID + forceClassId];
+    // component too small (noise) -> wipe to background
+    if (minArea > 0 && fg < minArea) {
+        target[k] = 0;
+        return;
     }
-    float confidence = (float)forceCount / (float)fg;
 
-    if (confidence >= threshold) {
-        target[k] = (unsigned char)forceClassId;
-    }
-    else {
-        // 多数投票
-        int bestCls = 0;
-        int bestCount = 0;
-        for (int c = 1; c < MAX_CLASS_ID; ++c) {
-            int cnt = hist[k * MAX_CLASS_ID + c];
-            if (cnt > bestCount) {
-                bestCount = cnt;
-                bestCls = c;
-            }
+    // pure majority vote (tie -> smaller cls; no votable class -> 0 = background)
+    int bestCls = 0;
+    int bestCount = 0;
+    for (int c = 1; c < MAX_CLASS_ID; ++c) {
+        int cnt = hist[k * MAX_CLASS_ID + c];
+        if (cnt > bestCount) {
+            bestCount = cnt;
+            bestCls = c;
         }
-        target[k] = (unsigned char)bestCls;
     }
+    target[k] = (unsigned char)bestCls;
 }
 
 // ============================================================================
@@ -686,7 +681,7 @@ static int ProcessGpuInternal(const char* inTags, char* outTags,
         dim3 block(256);
         dim3 grid((numComps + block.x) / block.x);
         k_decide << <grid, block >> > (d_fgInComp, d_hist, d_target,
-            g_unifyForceClassId, g_unifyThreshold, numComps);
+            g_unifyMinArea, numComps);
     }
 
     // 阶段 6: 染色 (in-place 到 d_combined)
