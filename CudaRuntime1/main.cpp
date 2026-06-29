@@ -23,6 +23,8 @@
 #include <mutex>
 #include <chrono>
 #include <queue>
+#include <algorithm>
+#include <vector>
 #include "windows.h"
 #include <ShlObj.h>
 #include <fstream>
@@ -236,19 +238,46 @@ Restart:
     Start_send();
     UnifyReset();
 
-    // 自动设置 sel_type
-    for (size_t i = 0; i < aiModel.CoreList.size(); i++) {
-        int classid = aiModel.CoreList[i].classid;
-        if (classid == 1) {
-            sel_type[classid - 1] = 1;
-            std::cout << "[Auto] sel_type[" << (classid - 1)
-                << "] = 1  (classid=" << classid
-                << " " << aiModel.CoreList[i].TargetName << " 将被剔除)" << std::endl;
+    // ===== 设置 sel_type: 优先读配置工具下发/持久化的 eject_select.json, 否则回退默认 =====
+    //   文件格式: {"eject":[1,4]}  表示吹 classid 1 和 4
+    //   只对模型 CoreList 里真实存在的 classid 生效 (classid 可能不连续, 如 1/2/4)
+    {
+        for (int i = 0; i < 12; i++) sel_type[i] = 0;
+
+        string pathEject = pathDoc + "\\SortingExpert\\param\\eject_select.json";
+        std::vector<int> ejectIds;
+        bool loaded = false;
+        try {
+            std::ifstream ef(pathEject);
+            if (ef.good()) {
+                json je;
+                ef >> je;
+                if (je.contains("eject")) {
+                    for (auto& v : je["eject"]) ejectIds.push_back(v.get<int>());
+                    loaded = true;
+                }
+            }
         }
-        else {
-            std::cout << "[Auto] 跳过 classid=" << classid
-                << " (" << aiModel.CoreList[i].TargetName << " 不剔除)" << std::endl;
+        catch (...) { loaded = false; }
+
+        for (size_t i = 0; i < aiModel.CoreList.size(); i++) {
+            int classid = aiModel.CoreList[i].classid;
+            if (classid < 1 || classid > 12) continue;
+
+            bool eject;
+            if (loaded)
+                eject = (std::find(ejectIds.begin(), ejectIds.end(), classid) != ejectIds.end());
+            else
+                eject = (classid == 1);   // 无配置文件时默认: 只吹 classid 1 (兼容旧行为)
+
+            sel_type[classid - 1] = eject ? 1 : 0;
+            std::cout << "[SelType] classid=" << classid
+                << " (" << aiModel.CoreList[i].TargetName << ") => "
+                << (eject ? "吹" : "不吹") << std::endl;
         }
+        std::cout << "[SelType] 吹气来源: "
+            << (loaded ? pathEject : std::string("默认(classid==1, 未找到 eject_select.json)"))
+            << std::endl;
     }
 
     // ★ v4.6 sel_type 已确定, 打一份完整参数快照到 perf.log
@@ -471,17 +500,6 @@ void threadFunction()
     static FrameTicks tickBufs[TAG_BUF_COUNT];
     int tickBufIdx = 0;
 
-    // ★ v4.5 分段计时累计
-    long long sum_memcpy_pinned_us = 0;
-    long long sum_h2d_us = 0;
-    long long sum_calc_us = 0;
-    long long sum_d2h_us = 0;
-    long long max_memcpy_pinned_us = 0;
-    long long max_h2d_us = 0;
-    long long max_calc_us = 0;
-    long long max_d2h_us = 0;
-    int timingCount = 0;
-
     while (startFlag) {
         WaitForSingleObject(hEventSort, INFINITE);
 
@@ -495,8 +513,6 @@ void threadFunction()
             tickBufIdx = (tickBufIdx + 1) % TAG_BUF_COUNT;
 
             // ===== 段 1: 从队列取帧 + memcpy 到 pinned host buffer =====
-            auto t_mp_0 = std::chrono::steady_clock::now();
-
             const int frameSize = g_Samples * g_bands * 2;
             for (size_t i = 0; i < (size_t)dealCount; i++) {
                 grabDatas.dequeue(data);
@@ -519,12 +535,9 @@ void threadFunction()
             }
             if (copyError) goto Error;
 
-            auto t_mp_1 = std::chrono::steady_clock::now();
-
-            // ===== 段 2: H2D cudaMemcpy (★ 这一行可能被 GPU 抢占) =====
+            // ===== 段 2: H2D cudaMemcpy =====
             cudaStatus = cudaMemcpy(cuda_frameData, hostPinnedFrameBuf,
                 frameBufSize, cudaMemcpyHostToDevice);
-            auto t_h2d_1 = std::chrono::steady_clock::now();
 
             if (cudaStatus != cudaSuccess) {
                 static bool firstError = true;
@@ -543,16 +556,14 @@ void threadFunction()
                 cuda_k_White, cuda_White_ReadBytes, cuda_Black_ReadBytes,
                 cuda_otherParams, cuda_preprocessList, cuda_modelWaveList,
                 cuda_Intercept, cuda_Coef, cuda_StdX, cuda_MeanX, cuda_tags);
-            auto t_calc_1 = std::chrono::steady_clock::now();
 
-            // ===== 段 4: D2H cudaMemcpy (★ 同样可能被抢占) =====
+            // ===== 段 4: D2H cudaMemcpy =====
             char* sortResult = tagBufs[tagBufIdx];
             tagBufIdx = (tagBufIdx + 1) % TAG_BUF_COUNT;
 
             cudaStatus = cudaMemcpy(sortResult, cuda_tags,
                 (size_t)dealCount * g_Samples,
                 cudaMemcpyDeviceToHost);
-            auto t_d2h_1 = std::chrono::steady_clock::now();
 
             if (cudaStatus != cudaSuccess) {
                 fprintf(stderr, "[ERROR] cudaMemcpy(D2H) 失败\n");
@@ -561,51 +572,12 @@ void threadFunction()
                 goto Error;
             }
 
-            // ===== 计算各段耗时 =====
-            long long us_memcpy_pinned = std::chrono::duration_cast<std::chrono::microseconds>(t_mp_1 - t_mp_0).count();
-            long long us_h2d = std::chrono::duration_cast<std::chrono::microseconds>(t_h2d_1 - t_mp_1).count();
-            long long us_calc = std::chrono::duration_cast<std::chrono::microseconds>(t_calc_1 - t_h2d_1).count();
-            long long us_d2h = std::chrono::duration_cast<std::chrono::microseconds>(t_d2h_1 - t_calc_1).count();
-
-            sum_memcpy_pinned_us += us_memcpy_pinned;
-            sum_h2d_us += us_h2d;
-            sum_calc_us += us_calc;
-            sum_d2h_us += us_d2h;
-            if (us_memcpy_pinned > max_memcpy_pinned_us) max_memcpy_pinned_us = us_memcpy_pinned;
-            if (us_h2d > max_h2d_us)           max_h2d_us = us_h2d;
-            if (us_calc > max_calc_us)          max_calc_us = us_calc;
-            if (us_d2h > max_d2h_us)           max_d2h_us = us_d2h;
-            timingCount++;
-
-            // ===== 慢路径监控: 任一段 > 5ms 立即详细日志 =====
-            if (us_h2d > 5000 || us_calc > 5000 || us_d2h > 5000 || us_memcpy_pinned > 5000) {
-                PERF_LOG("[threadFunction][SLOW] memcpy=%lldus h2d=%lldus calc=%lldus d2h=%lldus  grabQ=%d sortQ=%d",
-                    us_memcpy_pinned, us_h2d, us_calc, us_d2h,
-                    grabDatas.size(), sortResultDatas.size());
-            }
-
-            // ===== 每 100 批写一次汇总到 perf.log =====
-            if (timingCount % 100 == 0) {
-                long long avg_mp = sum_memcpy_pinned_us / 100;
-                long long avg_h2d = sum_h2d_us / 100;
-                long long avg_calc = sum_calc_us / 100;
-                long long avg_d2h = sum_d2h_us / 100;
-                PERF_LOG("[threadFunction][TIMING] memcpy avg=%lldus/max=%lldus  h2d avg=%lldus/max=%lldus  calc avg=%lldus/max=%lldus  d2h avg=%lldus/max=%lldus",
-                    avg_mp, max_memcpy_pinned_us,
-                    avg_h2d, max_h2d_us,
-                    avg_calc, max_calc_us,
-                    avg_d2h, max_d2h_us);
-                sum_memcpy_pinned_us = sum_h2d_us = sum_calc_us = sum_d2h_us = 0;
-                max_memcpy_pinned_us = max_h2d_us = max_calc_us = max_d2h_us = 0;
-            }
-
 #ifdef OUTPUT_SORTING_RESULT
             sortResultDatas.enqueue(sortResult);
             batchFrameTicksQueue.enqueue(fts);
             SetEvent(hEvent);
 
-            int batchId = g_batchNo.fetch_add(1);
-            LogDataAcquired(batchId, dealCount, dealCount * g_Samples);
+            g_batchNo.fetch_add(1);
 #endif
 #endif
         }
@@ -645,14 +617,6 @@ void threadFunction_dis()
         }
     }
 
-    long long sumUnifyUs = 0;
-    long long sumProcessUs = 0;
-    long long sumTotalUs = 0;
-    long long maxUnifyUs = 0;
-    long long maxProcessUs = 0;
-    long long maxTotalUs = 0;
-    int       timingCount = 0;
-
     while (startFlag)
     {
         WaitForSingleObject(hEvent, INFINITE);
@@ -665,59 +629,14 @@ void threadFunction_dis()
             firstByteList.dequeue(firstByte);
             batchFrameTicksQueue.dequeue(fts);
 
-            static int monitorCnt = 0;
-            if (++monitorCnt % 100 == 0) {
-                // ★ v4.5 队列水位走 PerfLog
-                PERF_LOG("[QUEUE] grabDatas=%d sortResultDatas=%d batchFrameTicksQueue=%d",
-                    grabDatas.size(), sortResultDatas.size(),
-                    batchFrameTicksQueue.size());
-            }
-
-            auto t0 = std::chrono::steady_clock::now();
-
             char* outBuf = unifyBufs[unifyBufIdx];
             unifyBufIdx = (unifyBufIdx + 1) % UNIFY_BUF_COUNT;
 
             UnifyProcess(tagBuf, outBuf, dealCount, g_Samples);
 
-            auto t1 = std::chrono::steady_clock::now();
-
             for (int i = 0; i < dealCount; i++) {
                 const char* frameTags = outBuf + i * g_Samples;
                 ProcessOneFrame(frameTags, fts->t[i]);
-            }
-
-            auto t2 = std::chrono::steady_clock::now();
-
-            long long unifyUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-            long long processUs = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
-            long long totalUs = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t0).count();
-
-            sumUnifyUs += unifyUs;
-            sumProcessUs += processUs;
-            sumTotalUs += totalUs;
-            if (unifyUs > maxUnifyUs)   maxUnifyUs = unifyUs;
-            if (processUs > maxProcessUs) maxProcessUs = processUs;
-            if (totalUs > maxTotalUs)   maxTotalUs = totalUs;
-            timingCount++;
-
-            // ★ v4.5 慢路径监控
-            if (totalUs > 5000) {
-                PERF_LOG("[threadFunction_dis][SLOW] unify=%lldus process=%lldus total=%lldus  grabQ=%d",
-                    unifyUs, processUs, totalUs, grabDatas.size());
-            }
-
-            // 每 100 批一次汇总
-            if (timingCount % 100 == 0) {
-                long long avgUnify = sumUnifyUs / 100;
-                long long avgProcess = sumProcessUs / 100;
-                long long avgTotal = sumTotalUs / 100;
-                PERF_LOG("[DIS-TIMING] unify avg=%lldus/max=%lldus  process avg=%lldus/max=%lldus  total avg=%lldus/max=%lldus",
-                    avgUnify, maxUnifyUs,
-                    avgProcess, maxProcessUs,
-                    avgTotal, maxTotalUs);
-                sumUnifyUs = sumProcessUs = sumTotalUs = 0;
-                maxUnifyUs = maxProcessUs = maxTotalUs = 0;
             }
         }
     }

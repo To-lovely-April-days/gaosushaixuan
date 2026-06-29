@@ -180,8 +180,9 @@ void LogAllParams(const char* tag)
     PERF_LOG("[PARAM] totalDelay=%dms duration=%dms valveRatio=%d%% valveThreshold=%d frameActivate=%d centerInflate=%d",
         (int)g_totalDelay, (int)g_duration, g_valveThresholdRatio,
         g_valveThreshold, g_frameActivateThreshold, g_centerValveInflate);
-    PERF_LOG("[PARAM] unify enable=%d useGpu=%d tailFrames=%d forceClassId=%d threshold=%.3f fillBg=%d",
-        (int)g_unifyEnable, (int)g_unifyUseGpu, g_unifyTailFrames,
+    PERF_LOG("[PARAM] unify(majority-vote) enable=%d useGpu=%d tailFrames=%d minArea=%d",
+        (int)g_unifyEnable, (int)g_unifyUseGpu, g_unifyTailFrames, g_unifyMinArea);
+    PERF_LOG("[PARAM] unify(deprecated) forceClassId=%d threshold=%.3f fillBg=%d",
         g_unifyForceClassId, g_unifyThreshold, (int)g_unifyFillBackground);
 
     // 哪些 class 会被吹（sel_type=1）
@@ -537,17 +538,6 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
     bool valve_trigger[VALVE_COUNT] = { false };
     int rawClassified = 0;
 
-    static int diag_frameCnt = 0;
-    bool isDiagFrame = (++diag_frameCnt % 1000 == 0);
-
-    int diag_pixCls0 = 0;
-    int diag_pixCls1 = 0;
-    int diag_pixCls2 = 0;
-    int diag_pixOther = 0;
-    int diag_valveHit1 = 0;
-    int diag_valveHit2 = 0;
-    int diag_valveHit3 = 0;
-
     for (int fa = 0; fa < VALVE_COUNT; fa++) {
         int x1 = g_valveMap[fa].x1;
         int x2 = g_valveMap[fa].x2;
@@ -556,13 +546,6 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
         int hitCount = 0;
         for (int x = x1; x <= x2; x++) {
             int cls = (unsigned char)frameTags[x];
-
-            if (isDiagFrame) {
-                if (cls == 0) diag_pixCls0++;
-                else if (cls == 1) diag_pixCls1++;
-                else if (cls == 2) diag_pixCls2++;
-                else diag_pixOther++;
-            }
 
             if (cls > 0 && cls <= 12 && sel_type[cls - 1] == 1) {
                 hitCount++;
@@ -576,12 +559,6 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
         }
         else {
             valve_trigger[fa] = (hitCount >= g_valveThreshold);
-        }
-
-        if (isDiagFrame) {
-            if (hitCount >= 1) diag_valveHit1++;
-            if (hitCount >= 2) diag_valveHit2++;
-            if (hitCount >= 3) diag_valveHit3++;
         }
     }
 
@@ -610,13 +587,6 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
                 // ★ v3.8 去掉热路径的 cout 输出
             }
         }
-    }
-
-    if (isDiagFrame) {
-        LogStats(diag_frameCnt,
-            diag_pixCls0, diag_pixCls1, diag_pixCls2, diag_pixOther,
-            diag_valveHit1, diag_valveHit2, diag_valveHit3,
-            g_valveThreshold);
     }
 
     if (g_centerValveInflate > 0) {
@@ -650,8 +620,7 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
     unsigned long long now = NowMs();
     long long elapsed = (long long)(now - frameTickMs);
     long long actualDelay = (long long)g_totalDelay - elapsed;
-    bool wasNegative = false;
-    if (actualDelay < 0) { actualDelay = 0; wasNegative = true; }
+    if (actualDelay < 0) { actualDelay = 0; }
     if (actualDelay > 65535) actualDelay = 65535;
     unsigned short delay = (unsigned short)actualDelay;
 
@@ -665,8 +634,6 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
     if (udpDurInt > 200) udpDurInt = 200;
     unsigned char udpDuration = (unsigned char)udpDurInt;
 
-    int currentBatch = g_batchNo.load();
-
     int i = 0;
     while (i < VALVE_COUNT) {
         if (!valve_trigger[i]) { i++; continue; }
@@ -679,17 +646,6 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
 
         int valveStart = segStart + 1;
         int valveEnd = segEnd + 1;
-
-        int hitPixels = 0;
-        for (int fa = segStart; fa <= segEnd; fa++) {
-            int x1 = g_valveMap[fa].x1;
-            int x2 = g_valveMap[fa].x2;
-            for (int x = x1; x <= x2; x++) {
-                int cls = (unsigned char)frameTags[x];
-                if (cls > 0 && cls <= 12 && sel_type[cls - 1] == 1) hitPixels++;
-            }
-        }
-        LogValveDetected(currentBatch, valveStart, valveEnd, hitPixels);
 
         unsigned char* p = txBuf + txLen;
         if (useUdp) {
@@ -721,45 +677,8 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
     }
 
     // ★ v3.8 异步: 不直接 WriteFile, 推队列后立即返回
-    int writeTime = 0;
-    bool writeOk = true;
     if (txLen > 0) {
-        unsigned long long t_before_write = NowMs();
         EnqueueSerialCmd(txBuf, txLen, useUdp);
-        unsigned long long t_after_write = NowMs();
-        writeTime = (int)(t_after_write - t_before_write);
-        // writeOk 总是 true (异步, 实际发送结果由线程处理)
-    }
-
-    {
-        int j = 0;
-        int idx = 0;
-        while (j < VALVE_COUNT && idx < cmdCount) {
-            if (!valve_trigger[j]) { j++; continue; }
-            int segStart = j, segEnd = j;
-            while (segEnd + 1 < VALVE_COUNT && valve_trigger[segEnd + 1]) segEnd++;
-
-            LogValveFiredFrame(segStart + 1, segEnd + 1, g_duration, delay,
-                (int)elapsed, writeTime, wasNegative, writeOk);
-
-            j = segEnd + 1;
-            idx++;
-        }
-    }
-
-    LogBatchSummary(currentBatch, rawClassified, rawClassified, cmdCount);
-
-    // ★ v3.8 去掉热路径上的 cerr 输出 (避免控制台阻塞导致 [LATE!] 雪崩)
-    //   原代码每 100 次 LATE 打印一行 [WARN], 但在 LATE 频繁时反而拖慢主流程
-    //   保留计数器, 通过其他方式查看 (event.log 已经有 [LATE!] 标记)
-    static std::atomic<int> g_lateCount{ 0 };
-    if (wasNegative) {
-        g_lateCount.fetch_add(1);
-    }
-
-    static std::atomic<int> g_slowWriteCount{ 0 };
-    if (writeTime > 5) {
-        g_slowWriteCount.fetch_add(1);
     }
 }
 
@@ -788,6 +707,8 @@ void ProcessOneFrame(const char* frameTags, unsigned long long frameTickMs)
 #define PID_UNIFY_FORCE_CLASSID    0x08
 #define PID_UNIFY_THRESHOLD        0x09
 #define PID_UNIFY_FILL_BG          0x0A
+#define PID_UNIFY_MIN_AREA         0x0B   // 多数投票版: 最小连通域面积(噪点过滤)
+#define PID_EJECT_MASK             0x0C   // 吹气选择掩码: bit0=classid1 ... bit11=classid12
 
 // 数据类型
 #define TYPE_INT32   0
@@ -928,6 +849,26 @@ static int ApplyParamImpl(unsigned char paramId, unsigned char dataType,
             << (g_unifyFillBackground ? "ON" : "OFF") << std::endl;
         return ACK_OK;
 
+    case PID_UNIFY_MIN_AREA:
+        if (dataType != TYPE_INT32) return ACK_TYPE_MISMATCH;
+        if (intVal < 0 || intVal > 100000) return ACK_OUT_OF_RANGE;
+        g_unifyMinArea = intVal;
+        std::cout << "[UDP] g_unifyMinArea = " << intVal
+            << " px (连通域 < 此值整块抹成背景, 不吹)" << std::endl;
+        return ACK_OK;
+
+    case PID_EJECT_MASK:
+        if (dataType != TYPE_INT32) return ACK_TYPE_MISMATCH;
+        if (intVal < 0 || intVal > 0xFFF) return ACK_OUT_OF_RANGE;   // 12 位掩码
+        for (int i = 0; i < 12; i++) sel_type[i] = (intVal >> i) & 1;
+        {
+            std::string ej;
+            for (int i = 0; i < 12; i++) if (sel_type[i]) ej += std::to_string(i + 1) + " ";
+            std::cout << "[UDP] eject mask = 0x" << std::hex << intVal << std::dec
+                << "  吹 classid: " << (ej.empty() ? "(none)" : ej.c_str()) << std::endl;
+        }
+        return ACK_OK;
+
     default:
         std::cerr << "[UDP] 未知参数 ID: 0x" << std::hex << (int)paramId
             << std::dec << std::endl;
@@ -950,6 +891,8 @@ static const char* ParamName(unsigned char id) {
     case PID_UNIFY_FORCE_CLASSID: return "unifyForceClassId";
     case PID_UNIFY_THRESHOLD:     return "unifyThreshold";
     case PID_UNIFY_FILL_BG:       return "unifyFillBg";
+    case PID_UNIFY_MIN_AREA:      return "unifyMinArea";
+    case PID_EJECT_MASK:          return "ejectMask";
     default:                      return "unknown";
     }
 }
@@ -1001,7 +944,7 @@ static void SendQueryAck(SOCKET sock, const sockaddr_in& clientAddr,
     int clientAddrLen)
 {
     // 头 6 + count 1 + 10 个参数 × 6 + checksum 1 = 68 字节
-    unsigned char buf[80];
+    unsigned char buf[128];   // 12 参数需 80 字节, 留余量
     int idx = 0;
     buf[idx++] = PROTO_HEADER1;
     buf[idx++] = PROTO_HEADER2;
@@ -1013,7 +956,7 @@ static void SendQueryAck(SOCKET sock, const sockaddr_in& clientAddr,
     idx += 2;
 
     int payloadStart = idx;
-    buf[idx++] = 10;        // 参数个数
+    buf[idx++] = 12;        // 参数个数
 
     // 10 个参数
     BuildParam(buf + idx, PID_TOTAL_DELAY, TYPE_INT32, (int)g_totalDelay, 0);
@@ -1035,6 +978,12 @@ static void SendQueryAck(SOCKET sock, const sockaddr_in& clientAddr,
     BuildParam(buf + idx, PID_UNIFY_THRESHOLD, TYPE_FLOAT, 0, g_unifyThreshold);
     idx += 6;
     BuildParam(buf + idx, PID_UNIFY_FILL_BG, TYPE_BOOL, g_unifyFillBackground ? 1 : 0, 0);
+    idx += 6;
+    BuildParam(buf + idx, PID_UNIFY_MIN_AREA, TYPE_INT32, g_unifyMinArea, 0);
+    idx += 6;
+    int ejectMaskQ = 0;
+    for (int i = 0; i < 12; i++) if (sel_type[i]) ejectMaskQ |= (1 << i);
+    BuildParam(buf + idx, PID_EJECT_MASK, TYPE_INT32, ejectMaskQ, 0);
     idx += 6;
 
     int payloadLen = idx - payloadStart;

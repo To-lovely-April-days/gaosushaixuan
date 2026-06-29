@@ -644,17 +644,6 @@ static int ProcessGpuInternal(const char* inTags, char* outTags,
         if (us > g_gpuMaxUs) g_gpuMaxUs = us;
         g_gpuCount++;
 
-        // ★ 每 100 批自动打印一次性能统计 (跟 CPU 版行为一致)
-        if (g_gpuCount % 100 == 0) {
-            long long avg = g_gpuTotalUs / g_gpuCount;
-            UnifyLog("[Unify-GPU] processed %d batches  avg=%lldus  max=%lldus  cur=%lldus  K=%d",
-                g_gpuCount, avg, g_gpuMaxUs, us, g_unifyTailFrames);
-        }
-        // ★ v4.5 慢路径监控
-        if (us > 5000) {
-            UnifyLog("[Unify-GPU][SLOW-NOCOMP] cur=%lldus K=%d N=%d H=%d W=%d",
-                us, K, N, H, W);
-        }
         return (int)us;
     }
 
@@ -718,17 +707,6 @@ static int ProcessGpuInternal(const char* inTags, char* outTags,
     if (us > g_gpuMaxUs) g_gpuMaxUs = us;
     g_gpuCount++;
 
-    // ★ 每 100 批自动打印一次性能统计 (跟 CPU 版行为一致)
-    if (g_gpuCount % 100 == 0) {
-        long long avg = g_gpuTotalUs / g_gpuCount;
-        UnifyLog("[Unify-GPU] processed %d batches  avg=%lldus  max=%lldus  cur=%lldus  K=%d",
-            g_gpuCount, avg, g_gpuMaxUs, us, g_unifyTailFrames);
-    }
-    // ★ v4.5 慢路径监控
-    if (us > 5000) {
-        UnifyLog("[Unify-GPU][SLOW] cur=%lldus numComps=%d K=%d N=%d H=%d W=%d",
-            us, numComps, K, N, H, W);
-    }
     return (int)us;
 }
 

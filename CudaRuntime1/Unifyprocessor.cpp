@@ -1,4 +1,4 @@
-// ============================================================================
+ï»¿// ============================================================================
 // File: UnifyProcessor.cpp
 // Purpose: Cross-batch connected-component unify processor (v3.6)
 //
@@ -456,21 +456,11 @@ int UnifyProcess_Cpu(const char* inTags, char* outTags, int numFrames, int numSa
     g_unifyTotalUs += us;
     if (us > g_unifyMaxUs) g_unifyMaxUs = us;
 
-    // print perf stats every 100 batches
-    if (g_unifyCallCount % 100 == 0) {
-        long long avg = g_unifyTotalUs / g_unifyCallCount;
-        std::cout << "[Unify] processed " << g_unifyCallCount << " batches"
-            << "  avg=" << avg << "us"
-            << "  max=" << g_unifyMaxUs << "us"
-            << "  cur=" << us << "us"
-            << "  K=" << actualK << std::endl;
-    }
-
     return us;
 }
 
 // ============================================================================
-// ¡ï v4.0 ÐÂÔö: Íâ²¿µ÷ÓÃµÄ CPU °æÍ³¼Æ´òÓ¡ (¹© GPU dispatcher µ÷ÓÃ)
+//    v4.0     :  â²¿   Ãµ  CPU   Í³ Æ´ Ó¡ (   GPU dispatcher     )
 // ============================================================================
 void UnifyLogStats_Cpu()
 {
